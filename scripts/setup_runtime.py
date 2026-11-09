@@ -167,8 +167,14 @@ def validate_runtime(target):
     if any(not path.exists() for path in required):
         return False,'WeTypeX engine host is not installed'
     bwrap=shutil.which('bwrap')
-    if not bwrap:
-        return False,'bubblewrap is not installed'
+    use_bwrap=False
+    if bwrap:
+        try:
+            test=subprocess.run([bwrap,'--ro-bind','/usr','/usr','--symlink','usr/bin','/bin','--proc','/proc','--dev','/dev','true'],
+                                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=2)
+            use_bwrap=(test.returncode==0)
+        except Exception:
+            use_bwrap=False
     try:
         report=subprocess.run([str(host),str(support),'network-info'],
                               stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
@@ -177,51 +183,66 @@ def validate_runtime(target):
     except (subprocess.TimeoutExpired,ValueError,OSError):
         return False,'unable to check UTF-8 JSON compatibility'
     with tempfile.TemporaryDirectory(prefix='.wetypex-check-') as work:
-        command=[bwrap,'--unshare-net','--unshare-pid','--die-with-parent',
-                 '--ro-bind','/usr','/usr','--symlink','usr/lib','/lib',
-                 '--ro-bind','/lib64','/lib64','--symlink','usr/bin','/bin',
-                 '--proc','/proc','--dev','/dev','--tmpfs','/tmp',
-                 '--ro-bind',str(target),'/input','--ro-bind',str(support),'/support',
-                 '--bind',work,'/work','--chdir','/work',
-                 '--setenv','PATH','/usr/bin','--setenv','HOME','/work',
-                 '--setenv','WETYPE_SUPPORT_DIR','/support',
-                 '/support/wetypex-engine-host','/input','validate']
+        if use_bwrap:
+            bwrap_prefix=[bwrap,'--unshare-net','--unshare-pid','--die-with-parent',
+                          '--ro-bind','/usr','/usr','--symlink','usr/lib','/lib',
+                          '--ro-bind','/lib64','/lib64','--symlink','usr/bin','/bin',
+                          '--proc','/proc','--dev','/dev','--tmpfs','/tmp',
+                          '--ro-bind',str(target),'/input','--ro-bind',str(support),'/support',
+                          '--bind',work,'/work','--chdir','/work',
+                          '--setenv','PATH','/usr/bin','--setenv','HOME','/work',
+                          '--setenv','WETYPE_SUPPORT_DIR','/support']
+            target_input='/input'
+            host_bin='/support/wetypex-engine-host'
+            run_env={}
+        else:
+            bwrap_prefix=[]
+            target_input=str(target)
+            host_bin=str(host)
+            run_env={'PATH':os.environ.get('PATH','/usr/bin'),'HOME':work,'WETYPE_SUPPORT_DIR':str(support)}
+        command=bwrap_prefix+[host_bin,target_input,'validate']
         try:
             result=subprocess.run(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.PIPE,timeout=20,env={})
+                                  stderr=subprocess.PIPE,timeout=20,env=run_env,cwd=work)
         except subprocess.TimeoutExpired:
             return False,'engine validation timed out'
         if result.returncode:
             return False,'engine validation failed'
-        transfer_command=command[:-3]+[
-            '/support/wetypex-engine-host','/input/flurry','flurry-credentials']
+        transfer_command=bwrap_prefix+[host_bin,f'{target_input}/flurry','flurry-credentials']
         try:
             transfer=subprocess.run(transfer_command,stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.PIPE,timeout=20,env={})
+                                    stderr=subprocess.PIPE,timeout=20,env=run_env,cwd=work)
         except subprocess.TimeoutExpired:
             return False,'file-transfer runtime validation timed out'
         if transfer.returncode:
             return False,'file-transfer runtime validation failed'
-        wxp2p_command=command[:-3]+[
-            '/support/wetypex-engine-host','/input/wxp2p','module-run']
+        wxp2p_command=bwrap_prefix+[host_bin,f'{target_input}/wxp2p','module-run']
         try:
             wxp2p=subprocess.run(wxp2p_command,stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.PIPE,timeout=20,env={})
+                                 stderr=subprocess.PIPE,timeout=20,env=run_env,cwd=work)
         except subprocess.TimeoutExpired:
             return False,'WXP2P runtime validation timed out'
         if wxp2p.returncode:
             return False,'WXP2P runtime validation failed'
-        combined_command=command[:-3]+[
-            '--setenv','WETYPE_AUX_RUNTIME','/input/wxp2p',
-            '--setenv','WETYPE_FLURRY_DOWNLOAD_DIR','/work/downloads',
-            '--setenv','WETYPE_FLURRY_TEMP_DIR','/work/parts',
-            '/support/wetypex-engine-host','/input/flurry','flurry-wxp2p-server']
+        if use_bwrap:
+            combined_command=bwrap_prefix[:-6]+[
+                '--setenv','WETYPE_AUX_RUNTIME','/input/wxp2p',
+                '--setenv','WETYPE_FLURRY_DOWNLOAD_DIR','/work/downloads',
+                '--setenv','WETYPE_FLURRY_TEMP_DIR','/work/parts',
+                host_bin,'/input/flurry','flurry-wxp2p-server']
+            combined_env={}
+        else:
+            combined_command=[host_bin,f'{target_input}/flurry','flurry-wxp2p-server']
+            combined_env=dict(run_env,
+                              WETYPE_AUX_RUNTIME=f'{target_input}/wxp2p',
+                              WETYPE_FLURRY_DOWNLOAD_DIR=f'{work}/downloads',
+                              WETYPE_FLURRY_TEMP_DIR=f'{work}/parts')
         try:
             combined=subprocess.run(combined_command,input=b'{"action":"quit"}\n',
                                     stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-                                    timeout=20,env={})
+                                    timeout=20,env=combined_env,cwd=work)
         except subprocess.TimeoutExpired:
             return False,'combined WXP2P runtime validation timed out'
         try:
@@ -243,7 +264,8 @@ def main():
     args=ap.parse_args()
     data=pathlib.Path(os.environ.get('XDG_DATA_HOME',str(pathlib.Path.home()/'.local/share')))
     target=args.runtime_dir or pathlib.Path(os.environ.get('WETYPE_RUNTIME_DIR',str(data/'fcitx5-wetypex/runtime')))
-    if platform.system()!='Linux' or platform.machine()!='x86_64':ap.error('WeTypeX supports Linux x86-64 only')
+    if platform.system()!='Linux' or platform.machine() not in ('x86_64','aarch64','arm64'):
+        ap.error('WeTypeX supports Linux x86-64 and aarch64 only')
     if args.check:
         required=['image.macho','manifest.txt','symbols.txt','dicts.txt','resources/index.json','runtime.json',
                   'flurry/image.macho','flurry/manifest.txt',

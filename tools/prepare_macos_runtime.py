@@ -3,10 +3,12 @@
 import argparse
 import hashlib
 import pathlib
+import platform
 import struct
 
 FAT_MAGIC = 0xCAFEBABE
 CPU_TYPE_X86_64 = 0x01000007
+CPU_TYPE_ARM64 = 0x0100000C
 MH_MAGIC_64 = 0xFEEDFACF
 LC_SEGMENT_64 = 0x19
 LC_SYMTAB = 0x2
@@ -160,8 +162,14 @@ def main():
     parser.add_argument('--expected-sha256', default=EXPECTED)
     parser.add_argument('--slide', type=lambda value:int(value,0), default=0)
     parser.add_argument('--export-prefix', action='append', default=[])
+    parser.add_argument('--arch', choices=['x86_64', 'arm64', 'auto'], default='auto')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
+
+    target_arch = args.arch
+    if target_arch == 'auto':
+        target_arch = 'arm64' if platform.machine() in ('aarch64', 'arm64') else 'x86_64'
+    target_cputype = CPU_TYPE_ARM64 if target_arch == 'arm64' else CPU_TYPE_X86_64
 
     raw = args.binary.read_bytes()
     if hashlib.sha256(raw).hexdigest() != args.expected_sha256:
@@ -171,16 +179,16 @@ def main():
         raise ValueError('invalid universal Mach-O container')
     architectures = [struct.unpack_from('>IIIII', raw, 8 + i * 20)
                      for i in range(count)]
-    arch = next((item for item in architectures if item[0] == CPU_TYPE_X86_64), None)
+    arch = next((item for item in architectures if item[0] == target_cputype), None)
     if not arch:
-        raise ValueError('x86-64 Mach-O slice is missing')
+        raise ValueError(f'{target_arch} Mach-O slice is missing')
     thin = raw[arch[2]:arch[2] + arch[3]]
     if len(thin) != arch[3]:
-        raise ValueError('truncated x86-64 Mach-O slice')
+        raise ValueError(f'truncated {target_arch} Mach-O slice')
 
     header = struct.unpack_from('<8I', thin)
-    if header[0] != MH_MAGIC_64 or header[1] != CPU_TYPE_X86_64:
-        raise ValueError('invalid x86-64 Mach-O header')
+    if header[0] != MH_MAGIC_64 or header[1] != target_cputype:
+        raise ValueError(f'invalid {target_arch} Mach-O header')
     ncmds, sizeofcmds = header[4], header[5]
     if 32 + sizeofcmds > len(thin):
         raise ValueError('truncated Mach-O load commands')
@@ -301,9 +309,10 @@ def main():
                 else:
                     raise ValueError(f'unsupported unwind page {kind}')
             unwind.sort()
+            target_unwind_mode = 4 if target_arch == 'arm64' else 1
             for index, (function, encoding) in enumerate(unwind):
                 end = unwind[index + 1][0] if index + 1 < len(unwind) else indices[-1][0]
-                if ((encoding >> 24) & 15) == 1:
+                if ((encoding >> 24) & 15) == target_unwind_mode:
                     lines.append(f'UNWIND {imagebase + function + args.slide:x} {end - function:x} '
                                  f'{encoding:x} {lsdas.get(function, 0):x}')
 
@@ -316,7 +325,7 @@ def main():
     (args.output / 'symbols.txt').write_text('\n'.join(
         f'{value:x} {name}' for value, name in sorted(debug_names.items())) + '\n')
     (args.output / 'sha256.txt').write_text(hashlib.sha256(raw).hexdigest() + '\n')
-    print(f'Prepared {len(thin)} byte x86-64 image; metadata only.')
+    print(f'Prepared {len(thin)} byte {target_arch} image; metadata only.')
 
 
 if __name__ == '__main__':
