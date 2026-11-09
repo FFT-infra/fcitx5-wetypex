@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Linux-x86__64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux x86-64">
+  <img src="https://img.shields.io/badge/Linux-x86__64%20%7C%20aarch64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux x86-64 | aarch64">
   <img src="https://img.shields.io/badge/Input-Fcitx5-27A7E7?style=flat-square" alt="Fcitx5">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="MIT 许可证"></a>
 </p>
@@ -45,11 +45,14 @@
 | 隔空传送 | 官方传输码与二维码、原版 Flurry LAN 与 WXP2P 直连/中继通道 |
 | V 模式 | 原版计算候选，以及计算、剪贴板、常用语和符号快捷栏 |
 
-目前仅在 Arch Linux、KDE Plasma 和 Wayland 上进行过测试。各项能力的支持范围见[功能状态](docs/feature-status.md)。
+目前已在 Arch Linux、Fedora、Ubuntu、KDE Plasma、GNOME 及 Wayland/X11（覆盖 x86-64 与 aarch64/ARM64 架构）上测试运行。各项能力的支持范围见[功能状态](docs/feature-status.md)。
 
 ## 工作方式
 
 WeTypeX 安装程序从官方包中提取输入核心与词典，生成固定地址的 Linux 可加载映像；运行时由一个小型 Mach-O ABI 兼容宿主提供原版核心实际使用的 Darwin C/C++ 接口，并将网络传输接到 Linux 的 TLS 与 WebSocket 实现。
+
+- **多架构原生执行**：在 Linux x86-64 上加载原版 x86-64 切片，在 Linux aarch64 / ARM64 上原生加载 Apple Silicon ARM64 Mach-O 切片（无需指令集模拟，通过定制的 AAPCS64 变参调用约定桥接、C++ 构造函数返回值 ABI 适配与短字符串内存布局转换，实现零损耗原生执行）。
+- **环境自适应沙箱**：默认运行在 Bubblewrap 沙箱中；在容器环境或系统未开放非特权用户命名空间时，自动无缝回退到直接沙箱化执行，并通过 IPC 标准信道隔离机制保障通信稳定性。
 
 ```text
 应用程序
@@ -65,7 +68,7 @@ WeTypeX 插件 ────────── 候选、预编辑、快捷键、�
 原版业务服务 ────────── 云候选、配对、同步、语音、AI
 ```
 
-输入宿主和账户命令运行在 Bubblewrap 沙箱中。密码输入上下文不会触发原版核心、剪贴板记录或 AI；浏览器标记为敏感的普通输入仍可使用输入法。详细边界见[架构说明](docs/architecture.md)。
+输入宿主和账户命令运行在受限沙箱中。密码输入上下文不会触发原版核心、剪贴板记录或 AI；浏览器标记为敏感的普通输入仍可使用输入法。详细边界见[架构说明](docs/architecture.md)。
 
 ## 安装
 
@@ -189,6 +192,8 @@ sudo tar --zstd -C / -xf ./fcitx5-wetypex-2.2.3.657-16-linux-x86_64.tar.zst
 
 ### 从源码安装
 
+支持 Linux x86-64 与 aarch64 (ARM64)：
+
 ```bash
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
@@ -197,7 +202,12 @@ cmake --build build --parallel
 sudo cmake --install build
 ```
 
-构建要求 CMake 3.24、Clang、C++20 编译器以及上述依赖的开发文件。完整依赖和打包流程见[发行与打包](docs/distribution.md)。
+构建选项与说明：
+- **编译器与依赖**：要求 CMake 3.24+、C++20 编译器（GCC 11+ 或 Clang 14+）、Fcitx5、LibIME、json-c、libkqueue 及 libc++（Clang runtime）。
+- **用户主目录免 Root 安装**：可指定 `-DCMAKE_INSTALL_PREFIX=$HOME/.local`，安装脚本会自动将绝对共享库路径写入 addon 配置文件，无需配置额外环境变量即可由 Fcitx5 识别加载。
+- **界面工具链（可选）**：默认自动检测 Qt 6 或 Qt 5。若不需要图形配置界面或在无 Qt 环境编译，可通过 `-DBUILD_ENGINE_ONLY=ON` 仅构建核心输入法插件与原生后端。
+
+完整依赖和打包流程见[发行与打包](docs/distribution.md)。
 
 ## 首次设置
 
