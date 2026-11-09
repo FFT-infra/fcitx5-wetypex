@@ -3218,13 +3218,12 @@ static bool address_is_in_mapped_image(const void *value) {
   return false;
 }
 static void shim_free(void *value) {
-  // Some bundled BoringSSL/OpenSSL compatibility objects are backed directly
-  // by Mach-O __DATA and are accepted by Darwin's allocator cleanup path.  A
-  // glibc free on those image addresses aborts.  They remain owned by the
-  // mapped image and must live until the compatibility host exits.
   if (!value || address_is_in_mapped_image(value))
     return;
   free(value);
+}
+static void shim_delete_sized(void *value, size_t) {
+  shim_free(value);
 }
 static void shim_uuid_generate(unsigned char *output) {
   if (!output)
@@ -3447,6 +3446,12 @@ static void *resolve(const std::string &name) {
       {"__isPlatformVersionAtLeast", (void *)shim_isPlatformVersionAtLeast},
       {"_fopen$DARWIN_EXTSN", (void *)fopen},
       {"_free", (void *)shim_free},
+      {"__ZdlPv", (void *)shim_free},
+      {"__ZdlPvm", (void *)shim_delete_sized},
+      {"__ZdaPv", (void *)shim_free},
+      {"__ZdaPvm", (void *)shim_delete_sized},
+      {"__ZdlPvRKSt9nothrow_t", (void *)shim_free},
+      {"__ZdaPvRKSt9nothrow_t", (void *)shim_free},
       {"_freeaddrinfo", (void *)shim_freeaddrinfo},
       {"_getaddrinfo", (void *)shim_getaddrinfo},
       {"_getsockname", (void *)shim_getsockname},
