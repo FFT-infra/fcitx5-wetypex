@@ -31,6 +31,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
+#include <pwd.h>
 #include <semaphore.h>
 #include <set>
 #include <setjmp.h>
@@ -1807,19 +1808,68 @@ extern "C" int shim_sysctlbyname(const char *name, void *old_value,
                       static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
     return sysctl_copy(&memory, sizeof(memory), old_value, old_size);
   }
+  if (!strcmp(name, "hw.cpufamily")) {
+#if defined(__aarch64__) || defined(__arm64__)
+    uint32_t family = 0x1b588bb3; // CPUFAMILY_ARM_FIRESTORM_ICESTORM
+#else
+    uint32_t family = 0x37fc219f; // CPUFAMILY_INTEL_SKYLAKE
+#endif
+    return sysctl_copy(&family, sizeof(family), old_value, old_size);
+  }
+  if (!strcmp(name, "hw.cputype")) {
+#if defined(__aarch64__) || defined(__arm64__)
+    uint32_t type = 0x0100000c; // CPU_TYPE_ARM64
+#else
+    uint32_t type = 0x01000007; // CPU_TYPE_X86_64
+#endif
+    return sysctl_copy(&type, sizeof(type), old_value, old_size);
+  }
+  if (!strcmp(name, "hw.cpusubtype")) {
+#if defined(__aarch64__) || defined(__arm64__)
+    uint32_t subtype = 0; // CPU_SUBTYPE_ARM64_ALL
+#else
+    uint32_t subtype = 3; // CPU_SUBTYPE_X86_64_ALL
+#endif
+    return sysctl_copy(&subtype, sizeof(subtype), old_value, old_size);
+  }
+  if (!strcmp(name, "hw.byteorder")) {
+    int bo = 1234;
+    return sysctl_copy(&bo, sizeof(bo), old_value, old_size);
+  }
+  if (!strcmp(name, "hw.pagesize")) {
+    int ps = static_cast<int>(sysconf(_SC_PAGESIZE));
+    return sysctl_copy(&ps, sizeof(ps), old_value, old_size);
+  }
+  if (!strcmp(name, "hw.cachelinesize")) {
+    int cls = 128;
+    return sysctl_copy(&cls, sizeof(cls), old_value, old_size);
+  }
   const char *text = nullptr;
   if (!strcmp(name, "hw.model")) {
     text = getenv("WETYPE_DEVICE_MODEL");
-    if (!text || !*text)
-      text = "LINUX";
+    if (!text || !*text) {
+#if defined(__aarch64__) || defined(__arm64__)
+      text = "MacBookPro18,1";
+#else
+      text = "MacBookPro16,1";
+#endif
+    }
   } else if (!strcmp(name, "hw.machine")) {
+#if defined(__aarch64__) || defined(__arm64__)
+    text = "arm64";
+#else
     text = "x86_64";
+#endif
   } else if (!strcmp(name, "kern.osrelease")) {
     text = "24.2.0";
   } else if (!strcmp(name, "kern.osproductversion")) {
     text = "15.2";
   } else if (!strcmp(name, "machdep.cpu.brand_string")) {
-    text = "Linux x86_64";
+#if defined(__aarch64__) || defined(__arm64__)
+    text = "Apple M1";
+#else
+    text = "Intel Core Processor";
+#endif
   }
   if (text)
     return sysctl_copy(text, strlen(text) + 1, old_value, old_size);
@@ -3954,6 +4004,15 @@ int main(int argc, char **argv) {
                  !strcmp(argv[2], "flurry-server") ||
                  !strcmp(argv[2], "flurry-wxp2p-server") ||
                  !strcmp(argv[2], "wxp2p-probe");
+  if (!strcmp(argv[2], "serve")) {
+    int out_fd = dup(STDOUT_FILENO);
+    if (out_fd >= 0) {
+      service_output = fdopen(out_fd, "w");
+      if (service_output) {
+        dup2(STDERR_FILENO, STDOUT_FILENO);
+      }
+    }
+  }
   if (!service_mode && !getenv("WETYPE_NO_ALARM")) {
     const bool long_operation =
         !strcmp(argv[2], "llm-service") || !strcmp(argv[2], "flurry-loopback") || !strcmp(argv[2], "validate");
@@ -3972,11 +4031,25 @@ int main(int argc, char **argv) {
   sigaction(SIGABRT, &sa, nullptr);
   sigaction(SIGALRM, &sa, nullptr);
   std::string home = getenv("HOME") ? getenv("HOME") : "";
+  struct passwd *pw = getpwuid(getuid());
+  std::string real_home = pw && pw->pw_dir ? pw->pw_dir : home;
   const char *support = getenv("WETYPE_SUPPORT_DIR");
   std::string support_dir = support ? support : argv[1];
   void *cxxabi = dlopen("libc++abi.so.1", RTLD_NOW | RTLD_GLOBAL);
   if (!cxxabi && !home.empty()) {
     cxxabi = dlopen((home + "/.local/lib64/libc++abi.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
+  }
+  if (!cxxabi && !real_home.empty()) {
+    cxxabi = dlopen((real_home + "/.local/lib64/libc++abi.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (!cxxabi) {
+      cxxabi = dlopen((real_home + "/.local/lib/libc++abi.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
+    }
+  }
+  if (!cxxabi) {
+    cxxabi = dlopen((support_dir + "/libc++abi.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
+  }
+  if (!cxxabi) {
+    cxxabi = dlopen((support_dir + "/../libc++abi.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
   }
   auto darwinStrPath = support_dir + "/wetypex-darwin-str.so";
   if (access(darwinStrPath.c_str(), R_OK) == 0) {
@@ -3990,6 +4063,18 @@ int main(int argc, char **argv) {
   void *cxx = dlopen("libc++.so.1", RTLD_NOW | RTLD_GLOBAL);
   if (!cxx && !home.empty()) {
     cxx = dlopen((home + "/.local/lib64/libc++.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
+  }
+  if (!cxx && !real_home.empty()) {
+    cxx = dlopen((real_home + "/.local/lib64/libc++.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (!cxx) {
+      cxx = dlopen((real_home + "/.local/lib/libc++.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
+    }
+  }
+  if (!cxx) {
+    cxx = dlopen((support_dir + "/libc++.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
+  }
+  if (!cxx) {
+    cxx = dlopen((support_dir + "/../libc++.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
   }
   if (!cxxabi || !cxx) {
     const char *err = dlerror();

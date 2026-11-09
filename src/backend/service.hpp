@@ -450,10 +450,12 @@ static void service_snapshot(ServiceSession &s, json_object *response) {
 static void service_loop() {
   ServiceTransport transport;
   std::map<uint64_t, std::unique_ptr<ServiceSession>> sessions;
-  printf("{\"event\":\"ready\",\"protocol\":1,\"backend\":\"original-wetype-"
-         "native\",\"candidate_updates\":%s}\n",
-         transport.supportsUpdates() ? "true" : "false");
-  fflush(stdout);
+  FILE *out = service_output ? service_output : stdout;
+  fprintf(out,
+          "{\"event\":\"ready\",\"protocol\":1,\"backend\":\"original-wetype-"
+          "native\",\"candidate_updates\":%s}\n",
+          transport.supportsUpdates() ? "true" : "false");
+  fflush(out);
   std::string line;
   int source = 0;
   while (transport.next(line, source)) {

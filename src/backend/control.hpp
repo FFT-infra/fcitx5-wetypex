@@ -17,6 +17,9 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <vector>
+
+inline FILE *service_output = stdout;
+
 class ServiceTransport {
   struct Peer {
     std::string input, output;
@@ -189,8 +192,10 @@ public:
   }
   void reply(int source, const std::string &line) {
     if (source == STDIN_FILENO) {
-      puts(line.c_str());
-      fflush(stdout);
+      FILE *out = service_output ? service_output : stdout;
+      fputs(line.c_str(), out);
+      fputc('\n', out);
+      fflush(out);
       return;
     }
     auto it = peers_.find(source);
