@@ -21,22 +21,31 @@ if [ -f "$config_home/fcitx5/wetypex.json" ]; then
   standalone="$(python3 -c 'import json,sys; print(1 if json.load(open(sys.argv[1])).get("standalone",False) else 0)' "$config_home/fcitx5/wetypex.json" 2>/dev/null || printf 0)"
 fi
 
+can_bwrap=0
+if command -v bwrap >/dev/null 2>&1 && bwrap --ro-bind /usr /usr --proc /proc --dev /dev true 2>/dev/null; then
+  can_bwrap=1
+fi
+
+uin=""
+device_code=""
+model="LINUX"
+group_id=0
+group_functions=0
+hotword_version=0
+
 # The original desktop enables cloud candidates only when networking is
 # available.  Pairing initializes this per-user anonymous device identity.
 if [ "$standalone" = 0 ] && [ -f "$account/identity.json" ]; then
   uin="$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); print(v.get("uin", ""))' "$account/identity.json" 2>/dev/null || true)"
   device_code="$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); print(v.get("device_code", ""))' "$account/identity.json" 2>/dev/null || true)"
   model="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
-  group_id=0
-  group_functions=0
-  hotword_version=0
+  test -n "$model" || model=LINUX
   if [ -f "$state/sync-state.json" ]; then
     group_id="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("group_id",0)))' "$state/sync-state.json" 2>/dev/null || printf 0)"
     group_functions="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("func_switch",0)))' "$state/sync-state.json" 2>/dev/null || printf 0)"
     hotword_version="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("hotword_version",0)))' "$state/sync-state.json" 2>/dev/null || printf 0)"
   fi
-  test -n "$model" || model=LINUX
-  if [ -n "$uin" ] && [ -n "$device_code" ]; then
+  if [ "$can_bwrap" = 1 ] && [ -n "$uin" ] && [ -n "$device_code" ]; then
     env -i PATH="${PATH:-/usr/bin:/bin}" bwrap --unshare-pid --die-with-parent \
       --ro-bind /usr /usr --symlink usr/lib /lib --ro-bind /lib64 /lib64 --symlink usr/bin /bin \
       --proc /proc --dev /dev --tmpfs /tmp --dir /etc \
@@ -56,17 +65,12 @@ if [ "$standalone" = 0 ] && [ -f "$account/identity.json" ]; then
   fi
 fi
 
-can_bwrap=0
-if command -v bwrap >/dev/null 2>&1 && bwrap --ro-bind /usr /usr --symlink usr/bin /bin --proc /proc --dev /dev true 2>/dev/null; then
-  can_bwrap=1
-fi
-
 if [ "$can_bwrap" = 0 ]; then
   mkdir -p "$state/userDict/v5" "$state/userDict/user_hot_word"
   export PATH="${PATH:-/usr/bin:/bin}"
   export HOME="$state"
   export WETYPE_SUPPORT_DIR="$support"
-  if [ "$standalone" = 0 ] && [ -f "$account/identity.json" ]; then
+  if [ "$standalone" = 0 ] && [ -n "$uin" ] && [ -n "$device_code" ]; then
     export WETYPE_NETWORK_LIVE=1
     export WETYPE_CORE_UIN="$uin"
     export WETYPE_CORE_DEVICE_CODE="$device_code"

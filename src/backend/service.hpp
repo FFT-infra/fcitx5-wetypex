@@ -320,12 +320,17 @@ static bool service_select(ServiceSession &s, unsigned rank,
           s.published.begin(), s.published.end(), [expected](const auto &item) {
             return item.revision == uint64_t(expected);
           });
-      if (snapshot == s.published.end())
+      if (snapshot != s.published.end())
+        candidates = &snapshot->candidates;
+    }
+    if (candidates->empty()) {
+      if (candidates != &s.candidates && !s.candidates.empty())
+        candidates = &s.candidates;
+      else
         return false;
-      candidates = &snapshot->candidates;
     }
     if (rank >= candidates->size())
-      return false;
+      rank = 0;
     c = (*candidates)[rank];
     s.preserveCommitSpacing = c.calendarFormat || s.vMode;
     s.published.clear();
@@ -334,13 +339,16 @@ static bool service_select(ServiceSession &s, unsigned rank,
                       const char *, uint32_t, const void *, uint32_t,
                       const void *, uint32_t, const void *);
   ((Fn)syms.at("_wxime_select_candidate"))(
-      s.engine, c.engineText.data(), c.engineText.size(), c.id.data(),
+      s.engine, c.engineText.empty() ? nullptr : c.engineText.data(),
+      c.engineText.size(), c.id.empty() ? nullptr : c.id.data(),
       c.id.size(), nullptr, 0, nullptr, 0, nullptr, 0, nullptr);
   bool finishVMode = false;
   {
     std::lock_guard<std::mutex> lock(s.mutex);
     finishVMode = s.vMode && !s.commits.empty();
-    if (c.cover <= s.preedit.size())
+    if (c.cover >= s.preedit.size())
+      s.preedit.clear();
+    else
       s.preedit.erase(0, c.cover);
     s.cursor = s.preedit.size();
     if (s.pending && s.commits.empty())
@@ -822,8 +830,26 @@ static void service_loop() {
         }
       } else if (op == "select") {
         auto expected = wire::number(request.get(), "revision", -1);
-        if (!service_select(s, wire::number(request.get(), "index"), expected))
-          wire::put(response.get(), "error", std::string("stale candidate"));
+        if (!service_select(s, wire::number(request.get(), "index"), expected)) {
+          auto raw = s.selected + s.preedit;
+          if (!raw.empty()) {
+            ((void (*)(uint64_t))syms.at("_wxime_reset_session"))(s.engine);
+            std::lock_guard<std::mutex> lock(s.mutex);
+            s.pending = 0;
+            s.vMode = false;
+            s.preedit.clear();
+            s.selected.clear();
+            s.cursor = 0;
+            s.pendingRaw.clear();
+            s.displayPreedit.clear();
+            s.displayCursor = 0;
+            s.cursorStops.clear();
+            s.candidates.clear();
+            s.commits.push_back(raw);
+          } else {
+            wire::put(response.get(), "error", std::string("stale candidate"));
+          }
+        }
       } else if (op == "reset" || op == "raw") {
         auto raw = s.selected + s.preedit;
         ((void (*)(uint64_t))syms.at("_wxime_reset_session"))(s.engine);
