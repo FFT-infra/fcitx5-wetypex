@@ -322,15 +322,21 @@ static bool service_select(ServiceSession &s, unsigned rank,
           });
       if (snapshot != s.published.end())
         candidates = &snapshot->candidates;
+      else if (rank > 0)
+        return false;
     }
     if (candidates->empty()) {
-      if (candidates != &s.candidates && !s.candidates.empty())
+      if (candidates != &s.candidates && !s.candidates.empty() && rank == 0)
         candidates = &s.candidates;
       else
         return false;
     }
-    if (rank >= candidates->size())
-      rank = 0;
+    if (rank >= candidates->size()) {
+      if (rank == 0 && !candidates->empty())
+        rank = 0;
+      else
+        return false;
+    }
     c = (*candidates)[rank];
     s.preserveCommitSpacing = c.calendarFormat || s.vMode;
     s.published.clear();
@@ -823,9 +829,10 @@ static void service_loop() {
         }
       } else if (op == "select") {
         auto expected = wire::number(request.get(), "revision", -1);
-        if (!service_select(s, wire::number(request.get(), "index"), expected)) {
+        auto index = wire::number(request.get(), "index");
+        if (!service_select(s, index, expected)) {
           auto raw = s.selected + s.preedit;
-          if (!raw.empty()) {
+          if (!raw.empty() && index == 0) {
             ((void (*)(uint64_t))syms.at("_wxime_reset_session"))(s.engine);
             std::lock_guard<std::mutex> lock(s.mutex);
             s.pending = 0;

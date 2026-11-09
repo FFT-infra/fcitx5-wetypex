@@ -5,6 +5,7 @@
 #include <system_error>
 #include <cstdlib>
 #include <cstdio>
+#include <algorithm>
 
 template class std::__1::basic_string<char>;
 template class std::__1::basic_string<wchar_t>;
@@ -115,47 +116,56 @@ unsigned long long stoull(const string &__str, size_t *__idx, int __base) {
 string to_string(int val) {
   char buf[32];
   int n = ::snprintf(buf, sizeof(buf), "%d", val);
-  return string(buf, n > 0 ? n : 0);
+  if (n <= 0) return string();
+  return string(buf, std::min<size_t>(n, sizeof(buf) - 1));
 }
 string to_string(long val) {
   char buf[32];
   int n = ::snprintf(buf, sizeof(buf), "%ld", val);
-  return string(buf, n > 0 ? n : 0);
+  if (n <= 0) return string();
+  return string(buf, std::min<size_t>(n, sizeof(buf) - 1));
 }
 string to_string(long long val) {
   char buf[32];
   int n = ::snprintf(buf, sizeof(buf), "%lld", val);
-  return string(buf, n > 0 ? n : 0);
+  if (n <= 0) return string();
+  return string(buf, std::min<size_t>(n, sizeof(buf) - 1));
 }
 string to_string(unsigned val) {
   char buf[32];
   int n = ::snprintf(buf, sizeof(buf), "%u", val);
-  return string(buf, n > 0 ? n : 0);
+  if (n <= 0) return string();
+  return string(buf, std::min<size_t>(n, sizeof(buf) - 1));
 }
 string to_string(unsigned long val) {
   char buf[32];
   int n = ::snprintf(buf, sizeof(buf), "%lu", val);
-  return string(buf, n > 0 ? n : 0);
+  if (n <= 0) return string();
+  return string(buf, std::min<size_t>(n, sizeof(buf) - 1));
 }
 string to_string(unsigned long long val) {
   char buf[32];
   int n = ::snprintf(buf, sizeof(buf), "%llu", val);
-  return string(buf, n > 0 ? n : 0);
+  if (n <= 0) return string();
+  return string(buf, std::min<size_t>(n, sizeof(buf) - 1));
 }
 string to_string(float val) {
-  char buf[32];
+  char buf[128];
   int n = ::snprintf(buf, sizeof(buf), "%f", val);
-  return string(buf, n > 0 ? n : 0);
+  if (n <= 0) return string();
+  return string(buf, std::min<size_t>(n, sizeof(buf) - 1));
 }
 string to_string(double val) {
-  char buf[32];
+  char buf[384];
   int n = ::snprintf(buf, sizeof(buf), "%f", val);
-  return string(buf, n > 0 ? n : 0);
+  if (n <= 0) return string();
+  return string(buf, std::min<size_t>(n, sizeof(buf) - 1));
 }
 string to_string(long double val) {
-  char buf[64];
+  char buf[512];
   int n = ::snprintf(buf, sizeof(buf), "%Lf", val);
-  return string(buf, n > 0 ? n : 0);
+  if (n <= 0) return string();
+  return string(buf, std::min<size_t>(n, sizeof(buf) - 1));
 }
 }
 
