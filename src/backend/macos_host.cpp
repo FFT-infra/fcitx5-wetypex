@@ -53,6 +53,7 @@
 #include <vector>
 
 static std::map<std::string, uintptr_t> syms;
+static void *darwin_str_handle = nullptr;
 static std::vector<std::pair<uintptr_t, std::string>> address_names;
 static std::vector<std::pair<uintptr_t, uintptr_t>> mapped_image_ranges;
 static uintptr_t tls_data = 0, tls_size = 0, tls_total = 0;
@@ -1080,6 +1081,78 @@ extern "C" int shim_mutex_destroy(void *p) {
   pthread_mutex_unlock(&registry_lock);
   return r;
 }
+extern "C" void *shim_recursive_mutex_ctor(void *p) {
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+  shim_mutex_init(p, &attr);
+  pthread_mutexattr_destroy(&attr);
+  return p;
+}
+extern "C" void *shim_recursive_mutex_dtor(void *p) {
+  shim_mutex_destroy(p);
+  return p;
+}
+extern "C" void shim_recursive_mutex_lock(void *p) {
+  shim_mutex_lock(p);
+}
+extern "C" void shim_recursive_mutex_unlock(void *p) {
+  shim_mutex_unlock(p);
+}
+extern "C" bool shim_recursive_mutex_try_lock(void *p) {
+  return shim_mutex_trylock(p) == 0;
+}
+static void *(*real_thread_struct_ctor)(void *) = nullptr;
+extern "C" void *shim_thread_struct_ctor(void *p) {
+  if (!real_thread_struct_ctor) {
+    void *h = dlopen("libc++.so.1", RTLD_NOLOAD | RTLD_LAZY);
+    if (h)
+      real_thread_struct_ctor =
+          (void *(*)(void *))dlsym(h, "_ZNSt3__115__thread_structC1Ev");
+  }
+  if (real_thread_struct_ctor)
+    real_thread_struct_ctor(p);
+  return p;
+}
+
+#if defined(__aarch64__)
+#define DEFINE_CTOR_WRAPPER_1(name, sym_name) \
+  extern "C" void *name(void *self) { \
+    static auto fn = (void (*)(void *))dlsym(RTLD_DEFAULT, sym_name); \
+    if (fn) fn(self); \
+    return self; \
+  }
+
+#define DEFINE_CTOR_WRAPPER_2(name, sym_name, T2) \
+  extern "C" void *name(void *self, T2 a2) { \
+    static auto fn = (void (*)(void *, T2))dlsym(RTLD_DEFAULT, sym_name); \
+    if (fn) fn(self, a2); \
+    return self; \
+  }
+
+#define DEFINE_CTOR_WRAPPER_3(name, sym_name, T2, T3) \
+  extern "C" void *name(void *self, T2 a2, T3 a3) { \
+    static auto fn = (void (*)(void *, T2, T3))dlsym(RTLD_DEFAULT, sym_name); \
+    if (fn) fn(self, a2, a3); \
+    return self; \
+  }
+
+DEFINE_CTOR_WRAPPER_1(shim_streambuf_ctor, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC2Ev")
+DEFINE_CTOR_WRAPPER_1(shim_locale_default_ctor, "_ZNSt3__16localeC1Ev")
+DEFINE_CTOR_WRAPPER_2(shim_locale_copy_ctor, "_ZNSt3__16localeC1ERKS0_", const void *)
+DEFINE_CTOR_WRAPPER_1(shim_shared_mutex_ctor, "_ZNSt3__119__shared_mutex_baseC1Ev")
+DEFINE_CTOR_WRAPPER_1(shim_promise_void_ctor, "_ZNSt3__17promiseIvEC1Ev")
+DEFINE_CTOR_WRAPPER_1(shim_bad_alloc_ctor, "_ZNSt9bad_allocC1Ev")
+DEFINE_CTOR_WRAPPER_1(shim_bad_cast_ctor, "_ZNSt8bad_castC1Ev")
+DEFINE_CTOR_WRAPPER_1(shim_bad_array_new_length_ctor, "_ZNSt20bad_array_new_lengthC1Ev")
+DEFINE_CTOR_WRAPPER_2(shim_logic_error_str_ctor, "_ZNSt11logic_errorC1EPKc", const char *)
+DEFINE_CTOR_WRAPPER_2(shim_runtime_error_str_ctor, "_ZNSt13runtime_errorC1EPKc", const char *)
+DEFINE_CTOR_WRAPPER_2(shim_system_error_ec_ctor, "_ZNSt3__112system_errorC1ENS_10error_codeE", std::error_code)
+DEFINE_CTOR_WRAPPER_3(shim_system_error_ec_str_ctor, "_ZNSt3__112system_errorC1ENS_10error_codeEPKc", std::error_code, const char *)
+DEFINE_CTOR_WRAPPER_2(shim_codecvt_ctor, "_ZNSt3__17codecvtIwc11__mbstate_tEC2Em", size_t)
+DEFINE_CTOR_WRAPPER_3(shim_istream_sentry_ctor, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE6sentryC1ERS3_b", void *, bool)
+DEFINE_CTOR_WRAPPER_2(shim_ostream_sentry_ctor, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_", void *)
+#endif
 extern "C" int shim_cond_init(void *p, const void *a) {
   if (a) {
     fputs("UNSUPPORTED cond attribute\n", stderr);
@@ -1370,6 +1443,19 @@ static int open_flags(int f) {
   }
   return n;
 }
+extern "C" int shim_open_impl(const char *p, int f, mode_t mode) {
+  int flags = open_flags(f);
+  if (flags < 0)
+    return -1;
+  int result = (flags & O_CREAT) ? open(p, flags, mode) : open(p, flags);
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr,
+            "DARWIN_OPEN path=%s flags=%x translated=%x mode=%o result=%d "
+            "errno=%d\n",
+            p, f, flags, unsigned(mode), result, errno);
+  return result;
+}
+#if !defined(__aarch64__)
 extern "C" int shim_open(const char *p, int f, ...) {
   mode_t mode = 0;
   if (f & 0x200) {
@@ -1378,17 +1464,9 @@ extern "C" int shim_open(const char *p, int f, ...) {
     mode = va_arg(a, int);
     va_end(a);
   }
-  int flags = open_flags(f);
-  if (flags < 0)
-    return -1;
-  int result = open(p, flags, mode);
-  if (getenv("WETYPE_HOST_DEBUG"))
-    fprintf(stderr,
-            "DARWIN_OPEN path=%s flags=%x translated=%x mode=%o result=%d "
-            "errno=%d\n",
-            p, f, flags, unsigned(mode), result, errno);
-  return result;
+  return shim_open_impl(p, f, mode);
 }
+#endif
 struct DarwinDirent {
   uint64_t ino, seek;
   uint16_t reclen, namlen;
@@ -1408,18 +1486,27 @@ extern "C" DarwinDirent *shim_readdir(DIR *d) {
   out.reclen = (21 + out.namlen + 1 + 3) & ~3;
   return &out;
 }
+extern "C" int shim_readdir_r(DIR *d, DarwinDirent *entry, DarwinDirent **result) {
+  auto e = readdir(d);
+  if (!e) {
+    *result = nullptr;
+    return 0;
+  }
+  entry->ino = e->d_ino;
+  entry->seek = e->d_off;
+  entry->namlen = strlen(e->d_name);
+  entry->type = e->d_type;
+  memcpy(entry->name, e->d_name, entry->namlen + 1);
+  entry->reclen = (21 + entry->namlen + 1 + 3) & ~3;
+  *result = entry;
+  return 0;
+}
 struct DarwinFlock {
   int64_t start, len;
   int32_t pid;
   int16_t type, whence;
 };
-extern "C" int shim_fcntl(int fd, int cmd, ...) {
-  va_list ap;
-  va_start(ap, cmd);
-  long arg = 0;
-  if (cmd != 1 && cmd != 3)
-    arg = va_arg(ap, long);
-  va_end(ap);
+extern "C" int shim_fcntl_impl(int fd, int cmd, long arg) {
   if (getenv("WETYPE_HOST_DEBUG"))
     fprintf(stderr, "DARWIN_FCNTL fd=%d command=%d argument=%ld\n", fd, cmd,
             arg);
@@ -1469,6 +1556,17 @@ extern "C" int shim_fcntl(int fd, int cmd, ...) {
   errno = EINVAL;
   return -1;
 }
+#if !defined(__aarch64__)
+extern "C" int shim_fcntl(int fd, int cmd, ...) {
+  va_list ap;
+  va_start(ap, cmd);
+  long arg = 0;
+  if (cmd != 1 && cmd != 3)
+    arg = va_arg(ap, long);
+  va_end(ap);
+  return shim_fcntl_impl(fd, cmd, arg);
+}
+#endif
 extern "C" void *shim_mmap(void *p, size_t n, int prot, int flags, int fd,
                            off_t offset) {
   int native = flags & 0x13; // SHARED, PRIVATE, FIXED are equal.
@@ -1523,6 +1621,114 @@ extern "C" void shim_malloc_zone_free(void *, void *pointer) { free(pointer); }
 extern "C" void *shim_malloc_zone_realloc(void *, void *pointer, size_t size) {
   return realloc(pointer, size);
 }
+extern "C" void *shim_objc_autoreleasePoolPush() { return (void *)1; }
+extern "C" void shim_objc_autoreleasePoolPop(void *) {}
+extern "C" void *shim_objc_retain(void *p) { return p; }
+extern "C" void shim_objc_release(void *) {}
+extern "C" void *shim_objc_autorelease(void *p) { return p; }
+extern "C" void *shim_objc_autoreleaseReturnValue(void *p) { return p; }
+extern "C" void *shim_objc_retainAutorelease(void *p) { return p; }
+extern "C" void *shim_objc_retainAutoreleasedReturnValue(void *p) { return p; }
+extern "C" void *shim_objc_retainAutoreleaseReturnValue(void *p) { return p; }
+extern "C" void *shim_objc_unsafeClaimAutoreleasedReturnValue(void *p) { return p; }
+extern "C" void shim_objc_storeStrong(void **loc, void *obj) {
+  if (loc) *loc = obj;
+}
+extern "C" void *shim_objc_msgSend_impl(void *self, const char *op) {
+  if (!self) return nullptr;
+  if (op) {
+    if (strcmp(op, "retain") == 0 || strcmp(op, "autorelease") == 0 || strcmp(op, "self") == 0)
+      return self;
+  }
+  return nullptr;
+}
+extern "C" void *shim_objc_msgSend();
+extern "C" void *shim_objc_msgSendSuper2();
+
+#if defined(__aarch64__)
+__asm__(
+    ".global shim_objc_msgSend\n"
+    "shim_objc_msgSend:\n"
+    "  cbz x0, .Lobjc_nil\n"
+    "  b shim_objc_msgSend_impl\n"
+    ".Lobjc_nil:\n"
+    "  fmov d0, xzr\n"
+    "  fmov d1, xzr\n"
+    "  ret\n"
+    ".global shim_objc_msgSendSuper2\n"
+    "shim_objc_msgSendSuper2:\n"
+    "  cbz x0, .Lobjc_super_nil\n"
+    "  b shim_objc_msgSend_impl\n"
+    ".Lobjc_super_nil:\n"
+    "  fmov d0, xzr\n"
+    "  fmov d1, xzr\n"
+    "  ret\n"
+);
+#else
+extern "C" void *shim_objc_msgSend() { return nullptr; }
+extern "C" void *shim_objc_msgSendSuper2() { return nullptr; }
+#endif
+
+extern "C" void *shim_objc_alloc(void *cls) { return nullptr; }
+extern "C" void *shim_objc_allocWithZone(void *cls) { return nullptr; }
+extern "C" void *shim_objc_alloc_init(void *cls) { return nullptr; }
+extern "C" void *shim_objc_getClass(const char *name) { return nullptr; }
+extern "C" void *shim_objc_getMetaClass(const char *name) { return nullptr; }
+extern "C" void *shim_objc_lookUpClass(const char *name) { return nullptr; }
+extern "C" void *shim_objc_opt_new(void *cls) { return nullptr; }
+extern "C" void *shim_objc_opt_class(void *obj) { return nullptr; }
+extern "C" void *shim_objc_opt_self(void *obj) { return obj; }
+extern "C" bool shim_objc_opt_isKindOfClass(void *obj, void *cls) { return false; }
+extern "C" bool shim_objc_opt_respondsToSelector(void *obj, void *sel) { return false; }
+extern "C" void *shim_object_getClass(void *obj) { return nullptr; }
+extern "C" const char *shim_sel_getName(void *sel) { return (const char *)sel; }
+extern "C" void *shim_sel_getUid(const char *str) { return (void *)str; }
+extern "C" void *shim_objc_retainBlock(void *b) { return b; }
+extern "C" void shim_objc_enumerationMutation(void *obj) {}
+extern "C" void *shim_objc_initWeak(void **loc, void *val) { if (loc) *loc = val; return val; }
+extern "C" void shim_objc_destroyWeak(void **loc) { if (loc) *loc = nullptr; }
+extern "C" void *shim_objc_loadWeakRetained(void **loc) { return loc ? *loc : nullptr; }
+extern "C" void *shim_objc_storeWeak(void **loc, void *val) { if (loc) *loc = val; return val; }
+extern "C" void shim_objc_copyWeak(void **to, void **from) { if (to) *to = from ? *from : nullptr; }
+extern "C" void shim_objc_moveWeak(void **to, void **from) { if (to) *to = from ? *from : nullptr; if (from) *from = nullptr; }
+extern "C" void shim_objc_sync_enter(void *obj) {}
+extern "C" void shim_objc_sync_exit(void *obj) {}
+extern "C" void *shim_objc_getAssociatedObject(void *obj, const void *key) { return nullptr; }
+extern "C" void shim_objc_setAssociatedObject(void *obj, const void *key, void *value, uintptr_t policy) {}
+
+struct mach_timebase_info_t {
+  uint32_t numer;
+  uint32_t denom;
+};
+extern "C" uint64_t shim_mach_absolute_time() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+extern "C" int shim_mach_timebase_info(mach_timebase_info_t *info) {
+  if (info) {
+    info->numer = 1;
+    info->denom = 1;
+  }
+  return 0;
+}
+extern "C" void *shim_mach_host_self() { return (void *)1; }
+extern "C" void *shim_mach_thread_self() { return (void *)1; }
+extern "C" int shim_host_page_size(void *host, size_t *out_page_size) {
+  if (out_page_size) *out_page_size = 4096;
+  return 0;
+}
+extern "C" void shim_random_device_ctor(void *self, const void *) {
+  memset(self, 0, 8);
+}
+extern "C" unsigned int shim_random_device_call(void *) {
+  unsigned int val = 0;
+  if (getrandom(&val, sizeof(val), 0) != sizeof(val)) {
+    val = (unsigned int)rand();
+  }
+  return val;
+}
+extern "C" void shim_random_device_dtor(void *) {}
 extern "C" size_t shim_malloc_size(const void *pointer) {
   return pointer ? malloc_usable_size(const_cast<void *>(pointer)) : 0;
 }
@@ -1658,6 +1864,148 @@ extern "C" __attribute__((used, noinline)) void *shim_tlv_impl(void *d) {
 }
 extern "C" void shim_tlv();
 extern "C" void shim_chkstk();
+#if defined(__aarch64__)
+extern "C" int shim_darwin_fprintf();
+extern "C" int shim_darwin_printf();
+extern "C" int shim_darwin_sprintf();
+extern "C" int shim_darwin_snprintf();
+extern "C" int shim_darwin_sscanf();
+extern "C" int shim_darwin_open();
+extern "C" int shim_darwin_fcntl();
+extern "C" int shim_darwin_ioctl();
+#endif
+#if defined(__aarch64__)
+asm(".text\n.global shim_chkstk\nshim_chkstk:\n"
+    "cmp w9, #4096\n"
+    "mov x10, sp\n"
+    "b.lo 2f\n"
+    "1:\n"
+    "sub x10, x10, #4096\n"
+    "ldr x11, [x10]\n"
+    "sub w9, w9, #4096\n"
+    "cmp w9, #4096\n"
+    "b.hi 1b\n"
+    "2:\n"
+    "sub x10, x10, x9\n"
+    "ldr x11, [x10]\n"
+    "ret\n");
+asm(".text\n.global shim_tlv\nshim_tlv:\n"
+    "stp x29, x30, [sp, -16]!\n"
+    "mov x29, sp\n"
+    "sub sp, sp, 256\n"
+    "stp x1, x2, [sp, 0]\n"
+    "stp x3, x4, [sp, 16]\n"
+    "stp x5, x6, [sp, 32]\n"
+    "stp x7, x8, [sp, 48]\n"
+    "stp x9, x10, [sp, 64]\n"
+    "stp x11, x12, [sp, 80]\n"
+    "stp x13, x14, [sp, 96]\n"
+    "stp x15, x16, [sp, 112]\n"
+    "stp q0, q1, [sp, 128]\n"
+    "stp q2, q3, [sp, 160]\n"
+    "stp q4, q5, [sp, 192]\n"
+    "stp q6, q7, [sp, 224]\n"
+    "bl shim_tlv_impl\n"
+    "ldp q6, q7, [sp, 224]\n"
+    "ldp q4, q5, [sp, 192]\n"
+    "ldp q2, q3, [sp, 160]\n"
+    "ldp q0, q1, [sp, 128]\n"
+    "ldp x15, x16, [sp, 112]\n"
+    "ldp x13, x14, [sp, 96]\n"
+    "ldp x11, x12, [sp, 80]\n"
+    "ldp x9, x10, [sp, 64]\n"
+    "ldp x7, x8, [sp, 48]\n"
+    "ldp x5, x6, [sp, 32]\n"
+    "ldp x3, x4, [sp, 16]\n"
+    "ldp x1, x2, [sp, 0]\n"
+    "add sp, sp, 256\n"
+    "ldp x29, x30, [sp], 16\n"
+    "ret\n"
+    ".global shim_darwin_fprintf\nshim_darwin_fprintf:\n"
+    "sub sp, sp, #48\n"
+    "stp x29, x30, [sp, #32]\n"
+    "mov x29, sp\n"
+    "add x8, sp, #48\n"
+    "str x8, [sp, #0]\n"
+    "str xzr, [sp, #8]\n"
+    "str xzr, [sp, #16]\n"
+    "str wzr, [sp, #24]\n"
+    "str wzr, [sp, #28]\n"
+    "mov x2, sp\n"
+    "bl vfprintf\n"
+    "ldp x29, x30, [sp, #32]\n"
+    "add sp, sp, #48\n"
+    "ret\n"
+    ".global shim_darwin_printf\nshim_darwin_printf:\n"
+    "sub sp, sp, #48\n"
+    "stp x29, x30, [sp, #32]\n"
+    "mov x29, sp\n"
+    "add x8, sp, #48\n"
+    "str x8, [sp, #0]\n"
+    "str xzr, [sp, #8]\n"
+    "str xzr, [sp, #16]\n"
+    "str wzr, [sp, #24]\n"
+    "str wzr, [sp, #28]\n"
+    "mov x1, sp\n"
+    "bl vprintf\n"
+    "ldp x29, x30, [sp, #32]\n"
+    "add sp, sp, #48\n"
+    "ret\n"
+    ".global shim_darwin_sprintf\nshim_darwin_sprintf:\n"
+    "sub sp, sp, #48\n"
+    "stp x29, x30, [sp, #32]\n"
+    "mov x29, sp\n"
+    "add x8, sp, #48\n"
+    "str x8, [sp, #0]\n"
+    "str xzr, [sp, #8]\n"
+    "str xzr, [sp, #16]\n"
+    "str wzr, [sp, #24]\n"
+    "str wzr, [sp, #28]\n"
+    "mov x2, sp\n"
+    "bl vsprintf\n"
+    "ldp x29, x30, [sp, #32]\n"
+    "add sp, sp, #48\n"
+    "ret\n"
+    ".global shim_darwin_snprintf\nshim_darwin_snprintf:\n"
+    "sub sp, sp, #48\n"
+    "stp x29, x30, [sp, #32]\n"
+    "mov x29, sp\n"
+    "add x8, sp, #48\n"
+    "str x8, [sp, #0]\n"
+    "str xzr, [sp, #8]\n"
+    "str xzr, [sp, #16]\n"
+    "str wzr, [sp, #24]\n"
+    "str wzr, [sp, #28]\n"
+    "mov x3, sp\n"
+    "bl vsnprintf\n"
+    "ldp x29, x30, [sp, #32]\n"
+    "add sp, sp, #48\n"
+    "ret\n"
+    ".global shim_darwin_sscanf\nshim_darwin_sscanf:\n"
+    "sub sp, sp, #48\n"
+    "stp x29, x30, [sp, #32]\n"
+    "mov x29, sp\n"
+    "add x8, sp, #48\n"
+    "str x8, [sp, #0]\n"
+    "str xzr, [sp, #8]\n"
+    "str xzr, [sp, #16]\n"
+    "str wzr, [sp, #24]\n"
+    "str wzr, [sp, #28]\n"
+    "mov x2, sp\n"
+    "bl vsscanf\n"
+    "ldp x29, x30, [sp, #32]\n"
+    "add sp, sp, #48\n"
+    "ret\n"
+    ".global shim_darwin_open\nshim_darwin_open:\n"
+    "ldr x2, [sp]\n"
+    "b shim_open_impl\n"
+    ".global shim_darwin_fcntl\nshim_darwin_fcntl:\n"
+    "ldr x2, [sp]\n"
+    "b shim_fcntl_impl\n"
+    ".global shim_darwin_ioctl\nshim_darwin_ioctl:\n"
+    "ldr x2, [sp]\n"
+    "b shim_ioctl\n");
+#else
 asm(".text\n.global shim_chkstk\nshim_chkstk:\npush %rcx\npush %rax\nlea "
     "24(%rsp),%rcx\n"
     "cmp $4096,%rax\njb 2f\n1: sub $4096,%rcx\ntestb $0,(%rcx)\nsub "
@@ -1684,6 +2032,7 @@ asm(".text\n.global shim_tlv\nshim_tlv:\n"
     "224(%rsp),%xmm14\nmovdqu 240(%rsp),%xmm15\n"
     "add $264,%rsp\npop %r11\npop %r10\npop %r9\npop %r8\npop %rcx\npop "
     "%rdx\npop %rsi\npop %rdi\nret\n");
+#endif
 extern "C" int __cxa_thread_atexit_impl(void (*)(void *), void *, void *);
 extern "C" int shim_tlv_atexit(void (*f)(void *), void *p) {
   return __cxa_thread_atexit_impl(f, p, (void *)&stack_guard);
@@ -1698,6 +2047,56 @@ static void show_address(uintptr_t pc) {
   } else
     fprintf(stderr, "0x%lx\n", pc);
 }
+#if defined(__aarch64__)
+static void crash(int sig, siginfo_t *info, void *ctx) {
+  auto uc = (ucontext_t *)ctx;
+  fprintf(stderr, "FAULT signal=%d address=%p pc=", sig, info->si_addr);
+  show_address(uc->uc_mcontext.pc);
+  Dl_info dli{};
+  if (dladdr((void *)uc->uc_mcontext.pc, &dli)) {
+    fprintf(stderr, "FAULT_DLADDR file=%s sym=%s offset=0x%lx fbase_off=0x%lx\n",
+            dli.dli_fname ? dli.dli_fname : "(null)",
+            dli.dli_sname ? dli.dli_sname : "(null)",
+            dli.dli_saddr ? (uintptr_t)uc->uc_mcontext.pc - (uintptr_t)dli.dli_saddr : 0,
+            (uintptr_t)uc->uc_mcontext.pc - (uintptr_t)dli.dli_fbase);
+  }
+  if (dladdr((void *)uc->uc_mcontext.regs[30], &dli)) {
+    fprintf(stderr, "FAULT_LR file=%s sym=%s offset=0x%lx fbase_off=0x%lx\n",
+            dli.dli_fname ? dli.dli_fname : "(null)",
+            dli.dli_sname ? dli.dli_sname : "(null)",
+            dli.dli_saddr ? (uintptr_t)uc->uc_mcontext.regs[30] - (uintptr_t)dli.dli_saddr : 0,
+            (uintptr_t)uc->uc_mcontext.regs[30] - (uintptr_t)dli.dli_fbase);
+  }
+  fprintf(stderr, "REG x0=%llx x1=%llx x2=%llx x8=%llx fp=%llx lr=%llx sp=%llx\n",
+          (long long)uc->uc_mcontext.regs[0],
+          (long long)uc->uc_mcontext.regs[1],
+          (long long)uc->uc_mcontext.regs[2],
+          (long long)uc->uc_mcontext.regs[8],
+          (long long)uc->uc_mcontext.regs[29],
+          (long long)uc->uc_mcontext.regs[30],
+          (long long)uc->uc_mcontext.sp);
+  fprintf(stderr, "BACKTRACE (fp chain):\n");
+  uintptr_t cur_fp = uc->uc_mcontext.regs[29];
+  for (int f = 0; f < 30 && cur_fp; ++f) {
+    uintptr_t *rec = (uintptr_t *)cur_fp;
+    uintptr_t next_fp = rec[0];
+    uintptr_t ret_addr = rec[1];
+    fprintf(stderr, "  #%d fp=%lx lr=%lx ", f, cur_fp, ret_addr);
+    show_address(ret_addr);
+    Dl_info info{};
+    if (dladdr((void *)ret_addr, &info)) {
+      fprintf(stderr, "    in %s (%s + 0x%lx, fbase_off=0x%lx)\n",
+              info.dli_fname ? info.dli_fname : "?",
+              info.dli_sname ? info.dli_sname : "?",
+              info.dli_saddr ? ret_addr - (uintptr_t)info.dli_saddr : 0,
+              ret_addr - (uintptr_t)info.dli_fbase);
+    }
+    if (next_fp <= cur_fp || next_fp > cur_fp + 0x100000) break;
+    cur_fp = next_fp;
+  }
+  _exit(128 + sig);
+}
+#else
 static void crash(int sig, siginfo_t *info, void *ctx) {
   auto uc = (ucontext_t *)ctx;
   fprintf(stderr, "FAULT signal=%d address=%p rip=", sig, info->si_addr);
@@ -1716,6 +2115,7 @@ static void crash(int sig, siginfo_t *info, void *ctx) {
   }
   _exit(128 + sig);
 }
+#endif
 extern "C" void missing_symbol(const char *n) {
   fprintf(stderr, "UNIMPLEMENTED %s\n", n);
   _exit(85);
@@ -1734,6 +2134,18 @@ static void *trap(const std::string &n) {
   auto code = trap_arena + trap_offset;
   trap_offset += 32;
   char *name = strdup(n.c_str());
+#if defined(__aarch64__)
+  *(uint32_t *)(code + 0) = 0x58000080; // LDR x0, [PC, #16]
+  *(uint32_t *)(code + 4) = 0x580000b0; // LDR x16, [PC, #20]
+  *(uint32_t *)(code + 8) = 0xd61f0200; // BR x16
+  *(uint32_t *)(code + 12) = 0xd503201f; // NOP
+  uintptr_t name_ptr = (uintptr_t)name;
+  memcpy(code + 16, &name_ptr, 8);
+  void *fn = (void *)&missing_symbol;
+  memcpy(code + 24, &fn, 8);
+  __builtin___clear_cache(reinterpret_cast<char *>(code),
+                          reinterpret_cast<char *>(code + 32));
+#else
   code[0] = 0x48;
   code[1] = 0xbf;
   memcpy(code + 2, &name, 8);
@@ -1743,6 +2155,7 @@ static void *trap(const std::string &n) {
   memcpy(code + 12, &fn, 8);
   code[20] = 0xff;
   code[21] = 0xe0;
+#endif
   return code;
 }
 struct DispatchSemaphore {
@@ -1823,6 +2236,69 @@ static void shim_dispatch_release(void *value) {
   sem_destroy(&semaphore->value);
   delete semaphore;
 }
+struct DarwinBlock {
+  void *isa;
+  int flags;
+  int reserved;
+  void (*invoke)(void *, ...);
+};
+static std::mutex dispatch_once_mutex;
+extern "C" void shim_dispatch_once_f(long *val, void *ctxt, void (*func)(void *)) {
+  if (__atomic_load_n(val, __ATOMIC_ACQUIRE) == -1)
+    return;
+  std::lock_guard<std::mutex> lock(dispatch_once_mutex);
+  if (*val != -1) {
+    if (func)
+      func(ctxt);
+    __atomic_store_n(val, -1, __ATOMIC_RELEASE);
+  }
+}
+extern "C" void shim_dispatch_once(long *val, void *block) {
+  if (__atomic_load_n(val, __ATOMIC_ACQUIRE) == -1)
+    return;
+  std::lock_guard<std::mutex> lock(dispatch_once_mutex);
+  if (*val != -1) {
+    auto b = (DarwinBlock *)block;
+    if (b && b->invoke)
+      b->invoke(block);
+    __atomic_store_n(val, -1, __ATOMIC_RELEASE);
+  }
+}
+extern "C" uint64_t shim_dispatch_time(uint64_t when, int64_t delta) {
+  if (when == 0) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    when = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+  }
+  return when + delta;
+}
+extern "C" void *shim_dispatch_get_global_queue(long identifier, unsigned long flags) {
+  static int dummy_global_queue = 1;
+  return &dummy_global_queue;
+}
+extern "C" void *shim_dispatch_queue_create(const char *label, void *attr) {
+  static int dummy_queue = 2;
+  return &dummy_queue;
+}
+extern "C" void shim_dispatch_sync(void *queue, void *block) {
+  auto b = (DarwinBlock *)block;
+  if (b && b->invoke)
+    b->invoke(block);
+}
+extern "C" void shim_dispatch_async(void *queue, void *block) {
+  auto b = (DarwinBlock *)block;
+  if (b && b->invoke)
+    b->invoke(block);
+}
+extern "C" void *shim_dispatch_group_create() {
+  static int dummy_group = 3;
+  return &dummy_group;
+}
+extern "C" void shim_dispatch_group_enter(void *group) {}
+extern "C" void shim_dispatch_group_leave(void *group) {}
+extern "C" long shim_dispatch_group_wait(void *group, uint64_t timeout) { return 0; }
+extern "C" bool shim_availability_version_check(uint32_t count, void *versions) { return true; }
+extern "C" bool shim_isPlatformVersionAtLeast(uint32_t platform, uint32_t major, uint32_t minor, uint32_t build) { return true; }
 static int shim_connectx() {
   errno = ENOTSUP;
   return -1;
@@ -2335,7 +2811,7 @@ static int shim_close(int fd) {
   pthread_mutex_unlock(&socket_state_lock);
   return close(fd);
 }
-static int shim_ioctl(int fd, unsigned long request, void *argument) {
+extern "C" int shim_ioctl(int fd, unsigned long request, void *argument) {
   constexpr unsigned long DarwinFionbio = 0x8004667eUL;
   constexpr unsigned long DarwinFionread = 0x4004667fUL;
   unsigned long native = request;
@@ -2354,12 +2830,25 @@ static const char *libcpp_path_cstr(const void *path) {
   if (!path)
     return nullptr;
   const auto *bytes = static_cast<const unsigned char *>(path);
+#if defined(__aarch64__)
+  // Apple Darwin ARM64 libc++ alternate string layout:
+  // Both long and short string store __is_long_ at byte 23 bit 7 (0x80).
+  // If long, __data_ pointer is at offset 0 (bytes).
+  // If short, __data_ buffer is at offset 0 (bytes).
+  if (bytes[23] & 0x80) {
+    const char *value = nullptr;
+    memcpy(&value, bytes, sizeof(value));
+    return value;
+  }
+  return reinterpret_cast<const char *>(bytes);
+#else
   if (bytes[0] & 1) {
     const char *value = nullptr;
     memcpy(&value, bytes + 16, sizeof(value));
     return value;
   }
   return reinterpret_cast<const char *>(bytes + 1);
+#endif
 }
 static void set_libcpp_error_code(void *errorCode, int value) {
   if (errorCode)
@@ -2446,6 +2935,228 @@ static void shim_filesystem_rename(const void *sourcePath,
             source ? source : "(null)", target ? target : "(null)", result,
             error);
 }
+#if defined(__aarch64__)
+extern "C" void shim_filesystem_status();
+extern "C" void *shim_filesystem_status_impl(const void *path, void *errorCode,
+                                             unsigned char *out) {
+  const char *p = libcpp_path_cstr(path);
+  if (!p) {
+    if (out) {
+      out[0] = 0;
+      *(uint32_t *)(out + 4) = 0;
+    }
+    set_libcpp_error_code(errorCode, EINVAL);
+    return out;
+  }
+  struct stat st {};
+  int ret = stat(p, &st);
+  if (ret != 0) {
+    int err = errno;
+    if (out) {
+      out[0] = (err == ENOENT || err == ENOTDIR) ? (unsigned char)-1 : 0;
+      *(uint32_t *)(out + 4) = 0;
+    }
+    if (err == ENOENT || err == ENOTDIR) {
+      set_libcpp_error_code(errorCode, 0);
+    } else {
+      set_libcpp_error_code(errorCode, err);
+    }
+    return out;
+  }
+  set_libcpp_error_code(errorCode, 0);
+  if (out) {
+    unsigned char ft = 8;
+    if (S_ISREG(st.st_mode))
+      ft = 1;
+    else if (S_ISDIR(st.st_mode))
+      ft = 2;
+    else if (S_ISLNK(st.st_mode))
+      ft = 3;
+    else if (S_ISBLK(st.st_mode))
+      ft = 4;
+    else if (S_ISCHR(st.st_mode))
+      ft = 5;
+    else if (S_ISFIFO(st.st_mode))
+      ft = 6;
+    else if (S_ISSOCK(st.st_mode))
+      ft = 7;
+    out[0] = ft;
+    *(uint32_t *)(out + 4) = st.st_mode & 07777;
+  }
+  return out;
+}
+asm(".text\n.global shim_filesystem_status\nshim_filesystem_status:\n"
+    "mov x2, x8\n"
+    "b shim_filesystem_status_impl\n");
+
+static bool shim_filesystem_create_directories(const void *path,
+                                               void *errorCode) {
+  const char *p = libcpp_path_cstr(path);
+  if (!p || !*p) {
+    set_libcpp_error_code(errorCode, EINVAL);
+    return false;
+  }
+  std::error_code ec;
+  bool res = std::filesystem::create_directories(p, ec);
+  set_libcpp_error_code(errorCode, ec.value());
+  return res;
+}
+
+static bool shim_filesystem_remove(const void *path, void *errorCode) {
+  const char *p = libcpp_path_cstr(path);
+  if (!p || !*p) {
+    set_libcpp_error_code(errorCode, EINVAL);
+    return false;
+  }
+  std::error_code ec;
+  bool res = std::filesystem::remove(p, ec);
+  set_libcpp_error_code(errorCode, ec.value());
+  return res;
+}
+
+static uintmax_t shim_filesystem_remove_all(const void *path, void *errorCode) {
+  const char *p = libcpp_path_cstr(path);
+  if (!p || !*p) {
+    set_libcpp_error_code(errorCode, EINVAL);
+    return 0;
+  }
+  std::error_code ec;
+  uintmax_t res = std::filesystem::remove_all(p, ec);
+  set_libcpp_error_code(errorCode, ec.value());
+  return res;
+}
+
+static uintmax_t shim_filesystem_file_size(const void *path, void *errorCode) {
+  const char *p = libcpp_path_cstr(path);
+  if (!p || !*p) {
+    set_libcpp_error_code(errorCode, EINVAL);
+    return 0;
+  }
+  std::error_code ec;
+  uintmax_t res = std::filesystem::file_size(p, ec);
+  set_libcpp_error_code(errorCode, ec.value());
+  return res;
+}
+
+static bool shim_filesystem_copy_file(const void *fromPath, const void *toPath,
+                                      unsigned int options, void *errorCode) {
+  const char *from = libcpp_path_cstr(fromPath);
+  const char *to = libcpp_path_cstr(toPath);
+  if (!from || !to) {
+    set_libcpp_error_code(errorCode, EINVAL);
+    return false;
+  }
+  std::error_code ec;
+  bool res = std::filesystem::copy_file(
+      from, to, static_cast<std::filesystem::copy_options>(options), ec);
+  set_libcpp_error_code(errorCode, ec.value());
+  return res;
+}
+
+static void shim_filesystem_copy(const void *fromPath, const void *toPath,
+                                 unsigned int options, void *errorCode) {
+  const char *from = libcpp_path_cstr(fromPath);
+  const char *to = libcpp_path_cstr(toPath);
+  if (!from || !to) {
+    set_libcpp_error_code(errorCode, EINVAL);
+    return;
+  }
+  std::error_code ec;
+  std::filesystem::copy(
+      from, to, static_cast<std::filesystem::copy_options>(options), ec);
+  set_libcpp_error_code(errorCode, ec.value());
+}
+
+static void *shim_filesystem_recursive_directory_iterator_ctor(
+    void *self, const void *path, unsigned int options, void *errorCode) {
+  const char *p = libcpp_path_cstr(path);
+  memset(self, 0, 24);
+  struct stat st;
+  if (!p || !*p || stat(p, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    if (errorCode)
+      set_libcpp_error_code(errorCode, ENOENT);
+    return self;
+  }
+  if (errorCode)
+    set_libcpp_error_code(errorCode, 0);
+  return self;
+}
+
+static void *shim_filesystem_directory_iterator_ctor(
+    void *self, const void *path, void *errorCode, unsigned int options) {
+  const char *p = libcpp_path_cstr(path);
+  memset(self, 0, 16);
+  struct stat st;
+  if (!p || !*p || stat(p, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    if (errorCode)
+      set_libcpp_error_code(errorCode, ENOENT);
+    return self;
+  }
+  if (errorCode)
+    set_libcpp_error_code(errorCode, 0);
+  return self;
+}
+
+static void *shim_filesystem_recursive_directory_iterator_inc(void *self, void *errorCode) {
+  if (errorCode)
+    set_libcpp_error_code(errorCode, 0);
+  return self;
+}
+
+static void *shim_filesystem_directory_iterator_inc(void *self, void *errorCode) {
+  if (errorCode)
+    set_libcpp_error_code(errorCode, 0);
+  return self;
+}
+
+static const void *shim_filesystem_directory_iterator_deref(const void *self) {
+  return nullptr;
+}
+#endif
+extern "C" int32_t shim_OSAtomicAdd32Barrier(int32_t amount, volatile int32_t *value) {
+  return __sync_add_and_fetch(value, amount);
+}
+extern "C" int64_t shim_OSAtomicAdd64Barrier(int64_t amount, volatile int64_t *value) {
+  return __sync_add_and_fetch(value, amount);
+}
+extern "C" bool shim_OSAtomicCompareAndSwap32Barrier(int32_t oldValue, int32_t newValue, volatile int32_t *value) {
+  return __sync_bool_compare_and_swap(value, oldValue, newValue);
+}
+extern "C" void shim_OSSpinLockLock(volatile int32_t *lock) {
+  while (!__sync_bool_compare_and_swap(lock, 0, 1)) {
+#if defined(__aarch64__)
+    asm volatile("yield");
+#elif defined(__x86_64__)
+    asm volatile("pause");
+#endif
+  }
+}
+extern "C" void shim_OSSpinLockUnlock(volatile int32_t *lock) {
+  __sync_lock_release(lock);
+}
+extern "C" void shim_os_unfair_lock_lock(volatile uint32_t *lock) {
+  while (!__sync_bool_compare_and_swap(lock, 0, 1)) {
+#if defined(__aarch64__)
+    asm volatile("yield");
+#elif defined(__x86_64__)
+    asm volatile("pause");
+#endif
+  }
+}
+extern "C" void shim_os_unfair_lock_unlock(volatile uint32_t *lock) {
+  __sync_lock_release(lock);
+}
+static uint64_t os_log_default_obj = 0;
+extern "C" bool shim_os_log_type_enabled(void *oslog, uint8_t type) {
+  return false;
+}
+extern "C" void shim_os_log_impl(void *dso, void *log, uint8_t type, const char *format, ...) {
+}
+extern "C" void shim_os_release(void *object) {
+}
+extern "C" void *shim_null_stub() {
+  return nullptr;
+}
 static int shim_notify_register() { return ENOTSUP; }
 static int shim_notify_cancel() { return 0; }
 static int shim_fd_overflow(int fd) { return fd >= FD_SETSIZE; }
@@ -2492,6 +3203,69 @@ static void shim_uuid_unparse(const unsigned char *value, char *output) {
            value[13], value[14], value[15]);
 }
 static double shim_exp10(double exponent) { return std::pow(10.0, exponent); }
+#if defined(__aarch64__)
+struct DarwinAarch64VaListShim {
+  void *__stack;
+  void *__gr_top;
+  void *__vr_top;
+  int __gr_offs;
+  int __vr_offs;
+};
+
+static int shim_darwin_vsnprintf(char *str, size_t size, const char *format,
+                                 void *darwin_ap) {
+  DarwinAarch64VaListShim ap_shim;
+  ap_shim.__stack = darwin_ap;
+  ap_shim.__gr_top = nullptr;
+  ap_shim.__vr_top = nullptr;
+  ap_shim.__gr_offs = 0;
+  ap_shim.__vr_offs = 0;
+  return vsnprintf(str, size, format, *(va_list *)&ap_shim);
+}
+
+static int shim_darwin_vfprintf(FILE *stream, const char *format,
+                                void *darwin_ap) {
+  DarwinAarch64VaListShim ap_shim;
+  ap_shim.__stack = darwin_ap;
+  ap_shim.__gr_top = nullptr;
+  ap_shim.__vr_top = nullptr;
+  ap_shim.__gr_offs = 0;
+  ap_shim.__vr_offs = 0;
+  return vfprintf(stream, format, *(va_list *)&ap_shim);
+}
+
+static int shim_darwin_vprintf(const char *format, void *darwin_ap) {
+  DarwinAarch64VaListShim ap_shim;
+  ap_shim.__stack = darwin_ap;
+  ap_shim.__gr_top = nullptr;
+  ap_shim.__vr_top = nullptr;
+  ap_shim.__gr_offs = 0;
+  ap_shim.__vr_offs = 0;
+  return vprintf(format, *(va_list *)&ap_shim);
+}
+
+static int shim_darwin_vasprintf(char **strp, const char *format,
+                                 void *darwin_ap) {
+  DarwinAarch64VaListShim ap_shim;
+  ap_shim.__stack = darwin_ap;
+  ap_shim.__gr_top = nullptr;
+  ap_shim.__vr_top = nullptr;
+  ap_shim.__gr_offs = 0;
+  ap_shim.__vr_offs = 0;
+  return vasprintf(strp, format, *(va_list *)&ap_shim);
+}
+
+static int shim_darwin_vsprintf(char *str, const char *format,
+                                void *darwin_ap) {
+  DarwinAarch64VaListShim ap_shim;
+  ap_shim.__stack = darwin_ap;
+  ap_shim.__gr_top = nullptr;
+  ap_shim.__vr_top = nullptr;
+  ap_shim.__gr_offs = 0;
+  ap_shim.__vr_offs = 0;
+  return vsprintf(str, format, *(va_list *)&ap_shim);
+}
+#endif
 static void *resolve(const std::string &name) {
   if (auto symbol = syms.find(name); symbol != syms.end())
     return reinterpret_cast<void *>(symbol->second);
@@ -2509,6 +3283,81 @@ static void *resolve(const std::string &name) {
       {"__tlv_bootstrap", (void *)shim_tlv},
       {"__tlv_atexit", (void *)shim_tlv_atexit},
       {"____chkstk_darwin", (void *)shim_chkstk},
+      {"___chkstk_darwin", (void *)shim_chkstk},
+#if defined(__aarch64__)
+      {"_fprintf", (void *)shim_darwin_fprintf},
+      {"_printf", (void *)shim_darwin_printf},
+      {"_sprintf", (void *)shim_darwin_sprintf},
+      {"_snprintf", (void *)shim_darwin_snprintf},
+      {"_sscanf", (void *)shim_darwin_sscanf},
+      {"_vsnprintf", (void *)shim_darwin_vsnprintf},
+      {"_vfprintf", (void *)shim_darwin_vfprintf},
+      {"_vprintf", (void *)shim_darwin_vprintf},
+      {"_vasprintf", (void *)shim_darwin_vasprintf},
+      {"_vsprintf", (void *)shim_darwin_vsprintf},
+      {"_open", (void *)shim_darwin_open},
+      {"_fcntl", (void *)shim_darwin_fcntl},
+      {"_ioctl", (void *)shim_darwin_ioctl},
+#else
+      {"_open", (void *)shim_open},
+      {"_fcntl", (void *)shim_fcntl},
+      {"_ioctl", (void *)shim_ioctl},
+#endif
+      {"_objc_autoreleasePoolPush", (void *)shim_objc_autoreleasePoolPush},
+      {"__objc_autoreleasePoolPush", (void *)shim_objc_autoreleasePoolPush},
+      {"_objc_autoreleasePoolPop", (void *)shim_objc_autoreleasePoolPop},
+      {"__objc_autoreleasePoolPop", (void *)shim_objc_autoreleasePoolPop},
+      {"_objc_retain", (void *)shim_objc_retain},
+      {"_objc_release", (void *)shim_objc_release},
+      {"_objc_autorelease", (void *)shim_objc_autorelease},
+      {"_objc_autoreleaseReturnValue", (void *)shim_objc_autoreleaseReturnValue},
+      {"_objc_retainAutorelease", (void *)shim_objc_retainAutorelease},
+      {"_objc_retainAutoreleasedReturnValue", (void *)shim_objc_retainAutoreleasedReturnValue},
+      {"_objc_retainAutoreleaseReturnValue", (void *)shim_objc_retainAutoreleaseReturnValue},
+      {"_objc_unsafeClaimAutoreleasedReturnValue", (void *)shim_objc_unsafeClaimAutoreleasedReturnValue},
+      {"_objc_storeStrong", (void *)shim_objc_storeStrong},
+      {"_objc_msgSend", (void *)shim_objc_msgSend},
+      {"__objc_msgSend", (void *)shim_objc_msgSend},
+      {"_objc_msgSendSuper2", (void *)shim_objc_msgSendSuper2},
+      {"__objc_msgSendSuper2", (void *)shim_objc_msgSendSuper2},
+      {"_objc_alloc", (void *)shim_objc_alloc},
+      {"_objc_allocWithZone", (void *)shim_objc_allocWithZone},
+      {"_objc_alloc_init", (void *)shim_objc_alloc_init},
+      {"_objc_getClass", (void *)shim_objc_getClass},
+      {"_objc_getMetaClass", (void *)shim_objc_getMetaClass},
+      {"_objc_lookUpClass", (void *)shim_objc_lookUpClass},
+      {"_objc_opt_new", (void *)shim_objc_opt_new},
+      {"_objc_opt_class", (void *)shim_objc_opt_class},
+      {"_objc_opt_self", (void *)shim_objc_opt_self},
+      {"_objc_opt_isKindOfClass", (void *)shim_objc_opt_isKindOfClass},
+      {"_objc_opt_respondsToSelector", (void *)shim_objc_opt_respondsToSelector},
+      {"_object_getClass", (void *)shim_object_getClass},
+      {"_sel_getName", (void *)shim_sel_getName},
+      {"_sel_getUid", (void *)shim_sel_getUid},
+      {"_objc_retainBlock", (void *)shim_objc_retainBlock},
+      {"_objc_enumerationMutation", (void *)shim_objc_enumerationMutation},
+      {"_objc_initWeak", (void *)shim_objc_initWeak},
+      {"_objc_destroyWeak", (void *)shim_objc_destroyWeak},
+      {"_objc_loadWeakRetained", (void *)shim_objc_loadWeakRetained},
+      {"_objc_storeWeak", (void *)shim_objc_storeWeak},
+      {"_objc_copyWeak", (void *)shim_objc_copyWeak},
+      {"_objc_moveWeak", (void *)shim_objc_moveWeak},
+      {"_objc_sync_enter", (void *)shim_objc_sync_enter},
+      {"_objc_sync_exit", (void *)shim_objc_sync_exit},
+      {"_objc_getAssociatedObject", (void *)shim_objc_getAssociatedObject},
+      {"_objc_setAssociatedObject", (void *)shim_objc_setAssociatedObject},
+      {"_mach_absolute_time", (void *)shim_mach_absolute_time},
+      {"_mach_timebase_info", (void *)shim_mach_timebase_info},
+      {"_mach_host_self", (void *)shim_mach_host_self},
+      {"_mach_thread_self", (void *)shim_mach_thread_self},
+      {"_host_page_size", (void *)shim_host_page_size},
+      {"__ZNSt3__113random_deviceC1ERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+       (void *)shim_random_device_ctor},
+      {"__ZNSt3__113random_deviceC2ERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+       (void *)shim_random_device_ctor},
+      {"__ZNSt3__113random_deviceclEv", (void *)shim_random_device_call},
+      {"__ZNSt3__113random_deviceD1Ev", (void *)shim_random_device_dtor},
+      {"__ZNSt3__113random_deviceD2Ev", (void *)shim_random_device_dtor},
       {"_dlsym", (void *)shim_dlsym},
       {"_malloc_create_zone", (void *)shim_malloc_create_zone},
       {"_malloc_default_zone", (void *)shim_malloc_default_zone},
@@ -2531,6 +3380,21 @@ static void *resolve(const std::string &name) {
       {"_dispatch_semaphore_create", (void *)shim_dispatch_semaphore_create},
       {"_dispatch_semaphore_signal", (void *)shim_dispatch_semaphore_signal},
       {"_dispatch_semaphore_wait", (void *)shim_dispatch_semaphore_wait},
+      {"_dispatch_once", (void *)shim_dispatch_once},
+      {"_dispatch_once_f", (void *)shim_dispatch_once_f},
+      {"_dispatch_time", (void *)shim_dispatch_time},
+      {"_dispatch_get_global_queue", (void *)shim_dispatch_get_global_queue},
+      {"_dispatch_queue_create", (void *)shim_dispatch_queue_create},
+      {"_dispatch_sync", (void *)shim_dispatch_sync},
+      {"_dispatch_async", (void *)shim_dispatch_async},
+      {"_dispatch_group_create", (void *)shim_dispatch_group_create},
+      {"_dispatch_group_enter", (void *)shim_dispatch_group_enter},
+      {"_dispatch_group_leave", (void *)shim_dispatch_group_leave},
+      {"_dispatch_group_wait", (void *)shim_dispatch_group_wait},
+      {"__availability_version_check", (void *)shim_availability_version_check},
+      {"_availability_version_check", (void *)shim_availability_version_check},
+      {"___isPlatformVersionAtLeast", (void *)shim_isPlatformVersionAtLeast},
+      {"__isPlatformVersionAtLeast", (void *)shim_isPlatformVersionAtLeast},
       {"_fopen$DARWIN_EXTSN", (void *)fopen},
       {"_free", (void *)shim_free},
       {"_freeaddrinfo", (void *)shim_freeaddrinfo},
@@ -2539,7 +3403,6 @@ static void *resolve(const std::string &name) {
       {"_getsockopt", (void *)shim_getsockopt},
       {"_inet_ntop", (void *)shim_inet_ntop},
       {"_inet_pton", (void *)shim_inet_pton},
-      {"_ioctl", (void *)shim_ioctl},
       {"_listen", (void *)shim_listen},
       {"_notify_cancel", (void *)shim_notify_cancel},
       {"_notify_register_file_descriptor", (void *)shim_notify_register},
@@ -2570,15 +3433,69 @@ static void *resolve(const std::string &name) {
       {"_uuid_unparse", (void *)shim_uuid_unparse},
       {"__ZNSt3__14__fs10filesystem8__renameERKNS1_4pathES4_PNS_10error_codeE",
        (void *)shim_filesystem_rename},
+#if defined(__aarch64__)
+      {"__ZNSt3__14__fs10filesystem8__statusERKNS1_4pathEPNS_10error_codeE",
+       (void *)shim_filesystem_status},
+      {"__ZNSt3__14__fs10filesystem20__create_directoriesERKNS1_4pathEPNS_10error_codeE",
+       (void *)shim_filesystem_create_directories},
+      {"__ZNSt3__14__fs10filesystem8__removeERKNS1_4pathEPNS_10error_codeE",
+       (void *)shim_filesystem_remove},
+      {"__ZNSt3__14__fs10filesystem12__remove_allERKNS1_4pathEPNS_10error_codeE",
+       (void *)shim_filesystem_remove_all},
+      {"__ZNSt3__14__fs10filesystem11__file_sizeERKNS1_4pathEPNS_10error_codeE",
+       (void *)shim_filesystem_file_size},
+      {"__ZNSt3__14__fs10filesystem11__copy_fileERKNS1_4pathES4_NS1_12copy_optionsEPNS_10error_codeE",
+       (void *)shim_filesystem_copy_file},
+      {"__ZNSt3__14__fs10filesystem6__copyERKNS1_4pathES4_NS1_12copy_optionsEPNS_10error_codeE",
+       (void *)shim_filesystem_copy},
+      {"__ZNSt3__14__fs10filesystem28recursive_directory_iteratorC1ERKNS1_4pathENS1_17directory_optionsEPNS_10error_codeE",
+       (void *)shim_filesystem_recursive_directory_iterator_ctor},
+      {"__ZNSt3__14__fs10filesystem28recursive_directory_iteratorC2ERKNS1_4pathENS1_17directory_optionsEPNS_10error_codeE",
+       (void *)shim_filesystem_recursive_directory_iterator_ctor},
+      {"__ZNSt3__14__fs10filesystem28recursive_directory_iterator11__incrementEPNS_10error_codeE",
+       (void *)shim_filesystem_recursive_directory_iterator_inc},
+      {"__ZNKSt3__14__fs10filesystem28recursive_directory_iterator13__dereferenceEv",
+       (void *)shim_filesystem_directory_iterator_deref},
+      {"__ZNSt3__14__fs10filesystem18directory_iteratorC1ERKNS1_4pathEPNS_10error_codeENS1_17directory_optionsE",
+       (void *)shim_filesystem_directory_iterator_ctor},
+      {"__ZNSt3__14__fs10filesystem18directory_iteratorC2ERKNS1_4pathEPNS_10error_codeENS1_17directory_optionsE",
+       (void *)shim_filesystem_directory_iterator_ctor},
+      {"__ZNSt3__14__fs10filesystem18directory_iterator11__incrementEPNS_10error_codeE",
+       (void *)shim_filesystem_directory_iterator_inc},
+      {"__ZNKSt3__14__fs10filesystem18directory_iterator13__dereferenceEv",
+       (void *)shim_filesystem_directory_iterator_deref},
+#endif
       {"_fstat$INODE64", (void *)shim_fstat},
       {"_fstatfs$INODE64", (void *)shim_fstatfs},
       {"_stat$INODE64", (void *)shim_stat},
       {"_statfs$INODE64", (void *)shim_statfs},
       {"_lstat$INODE64", (void *)shim_lstat},
-      {"_open", (void *)shim_open},
       {"_opendir$INODE64", (void *)opendir},
       {"_readdir$INODE64", (void *)shim_readdir},
-      {"_fcntl", (void *)shim_fcntl},
+      {"_fstat", (void *)shim_fstat},
+      {"_fstatfs", (void *)shim_fstatfs},
+      {"_stat", (void *)shim_stat},
+      {"_statfs", (void *)shim_statfs},
+      {"_lstat", (void *)shim_lstat},
+      {"_opendir", (void *)opendir},
+      {"_readdir", (void *)shim_readdir},
+      {"_readdir_r", (void *)shim_readdir_r},
+      {"_OSAtomicAdd32Barrier", (void *)shim_OSAtomicAdd32Barrier},
+      {"_OSAtomicAdd64Barrier", (void *)shim_OSAtomicAdd64Barrier},
+      {"_OSAtomicCompareAndSwap32Barrier", (void *)shim_OSAtomicCompareAndSwap32Barrier},
+      {"_OSSpinLockLock", (void *)shim_OSSpinLockLock},
+      {"_OSSpinLockUnlock", (void *)shim_OSSpinLockUnlock},
+      {"_os_unfair_lock_lock", (void *)shim_os_unfair_lock_lock},
+      {"_os_unfair_lock_unlock", (void *)shim_os_unfair_lock_unlock},
+      {"__os_log_default", &os_log_default_obj},
+      {"__os_log_impl", (void *)shim_os_log_impl},
+      {"_os_log_type_enabled", (void *)shim_os_log_type_enabled},
+      {"_os_release", (void *)shim_os_release},
+      {"_MTLCreateSystemDefaultDevice", (void *)shim_null_stub},
+      {"_MTLCopyAllDevices", (void *)shim_null_stub},
+      {"_CVMetalTextureCacheCreate", (void *)shim_null_stub},
+      {"_CVMetalTextureCacheCreateTextureFromImage", (void *)shim_null_stub},
+      {"_CVMetalTextureGetTexture", (void *)shim_null_stub},
       {"_pthread_rwlock_init", (void *)shim_rw_init},
       {"_pthread_rwlock_rdlock", (void *)shim_rw_rdlock},
       {"_pthread_rwlock_wrlock", (void *)shim_rw_wrlock},
@@ -2617,6 +3534,15 @@ static void *resolve(const std::string &name) {
       {"__ZNSt3__15mutex6unlockEv", (void *)shim_mutex_unlock},
       {"__ZNSt3__15mutex8try_lockEv", (void *)shim_cpp_mutex_try_lock},
       {"__ZNSt3__15mutexD1Ev", (void *)shim_mutex_destroy},
+      {"__ZNSt3__115recursive_mutexC1Ev", (void *)shim_recursive_mutex_ctor},
+      {"__ZNSt3__115recursive_mutexC2Ev", (void *)shim_recursive_mutex_ctor},
+      {"__ZNSt3__115recursive_mutexD1Ev", (void *)shim_recursive_mutex_dtor},
+      {"__ZNSt3__115recursive_mutexD2Ev", (void *)shim_recursive_mutex_dtor},
+      {"__ZNSt3__115recursive_mutex4lockEv", (void *)shim_recursive_mutex_lock},
+      {"__ZNSt3__115recursive_mutex6unlockEv", (void *)shim_recursive_mutex_unlock},
+      {"__ZNSt3__115recursive_mutex8try_lockEv", (void *)shim_recursive_mutex_try_lock},
+      {"__ZNSt3__115__thread_structC1Ev", (void *)shim_thread_struct_ctor},
+      {"__ZNSt3__115__thread_structC2Ev", (void *)shim_thread_struct_ctor},
       {"__ZNSt3__118condition_variable4waitERNS_11unique_lockINS_5mutexEEE",
        (void *)shim_cpp_cv_wait},
       {"__ZNSt3__118condition_variable10notify_oneEv",
@@ -2627,7 +3553,40 @@ static void *resolve(const std::string &name) {
        "5mutexEEENS_6chrono10time_pointINS5_12system_clockENS5_8durationIxNS_"
        "5ratioILl1ELl1000000000EEEEEEE",
        (void *)shim_cpp_cv_timed_wait},
-      {"__ZNSt3__118condition_variableD1Ev", (void *)shim_cond_destroy}};
+      {"__ZNSt3__118condition_variableD1Ev", (void *)shim_cond_destroy},
+#if defined(__aarch64__)
+      {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC1Ev", (void *)shim_streambuf_ctor},
+      {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC2Ev", (void *)shim_streambuf_ctor},
+      {"__ZNSt3__16localeC1Ev", (void *)shim_locale_default_ctor},
+      {"__ZNSt3__16localeC2Ev", (void *)shim_locale_default_ctor},
+      {"__ZNSt3__16localeC1ERKS0_", (void *)shim_locale_copy_ctor},
+      {"__ZNSt3__16localeC2ERKS0_", (void *)shim_locale_copy_ctor},
+      {"__ZNSt3__119__shared_mutex_baseC1Ev", (void *)shim_shared_mutex_ctor},
+      {"__ZNSt3__119__shared_mutex_baseC2Ev", (void *)shim_shared_mutex_ctor},
+      {"__ZNSt3__17promiseIvEC1Ev", (void *)shim_promise_void_ctor},
+      {"__ZNSt3__17promiseIvEC2Ev", (void *)shim_promise_void_ctor},
+      {"__ZNSt9bad_allocC1Ev", (void *)shim_bad_alloc_ctor},
+      {"__ZNSt9bad_allocC2Ev", (void *)shim_bad_alloc_ctor},
+      {"__ZNSt8bad_castC1Ev", (void *)shim_bad_cast_ctor},
+      {"__ZNSt8bad_castC2Ev", (void *)shim_bad_cast_ctor},
+      {"__ZNSt20bad_array_new_lengthC1Ev", (void *)shim_bad_array_new_length_ctor},
+      {"__ZNSt20bad_array_new_lengthC2Ev", (void *)shim_bad_array_new_length_ctor},
+      {"__ZNSt11logic_errorC1EPKc", (void *)shim_logic_error_str_ctor},
+      {"__ZNSt11logic_errorC2EPKc", (void *)shim_logic_error_str_ctor},
+      {"__ZNSt13runtime_errorC1EPKc", (void *)shim_runtime_error_str_ctor},
+      {"__ZNSt13runtime_errorC2EPKc", (void *)shim_runtime_error_str_ctor},
+      {"__ZNSt3__112system_errorC1ENS_10error_codeE", (void *)shim_system_error_ec_ctor},
+      {"__ZNSt3__112system_errorC2ENS_10error_codeE", (void *)shim_system_error_ec_ctor},
+      {"__ZNSt3__112system_errorC1ENS_10error_codeEPKc", (void *)shim_system_error_ec_str_ctor},
+      {"__ZNSt3__112system_errorC2ENS_10error_codeEPKc", (void *)shim_system_error_ec_str_ctor},
+      {"__ZNSt3__17codecvtIwc11__mbstate_tEC1Em", (void *)shim_codecvt_ctor},
+      {"__ZNSt3__17codecvtIwc11__mbstate_tEC2Em", (void *)shim_codecvt_ctor},
+      {"__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE6sentryC1ERS3_b", (void *)shim_istream_sentry_ctor},
+      {"__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE6sentryC2ERS3_b", (void *)shim_istream_sentry_ctor},
+      {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_", (void *)shim_ostream_sentry_ctor},
+      {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC2ERS3_", (void *)shim_ostream_sentry_ctor},
+#endif
+  };
   overrides.emplace("__ZNSt3__17promiseIvE10get_futureEv",
                     (void *)shim_promise_void_get_future);
   auto it = overrides.find(name);
@@ -2637,9 +3596,17 @@ static void *resolve(const std::string &name) {
     return dlsym(RTLD_DEFAULT, "wetype_locale_use_facet");
   if (name == "__ZNSt3__115__get_classnameEPKcb")
     return dlsym(RTLD_DEFAULT, "wetype_get_classname");
+  if (name.rfind("_objc_msgSend$", 0) == 0 || name.rfind("__objc_msgSend$", 0) == 0)
+    return (void *)shim_objc_msgSend;
   // Never attempt to use macOS framework objects as native ELF objects.
   if (name.rfind("_OBJC_", 0) == 0 || name.rfind("_$s", 0) == 0)
     return nullptr;
+  if (darwin_str_handle) {
+    if (void *sym = dlsym(darwin_str_handle, name.c_str() + 1))
+      return sym;
+    if (void *sym = dlsym(darwin_str_handle, name.c_str()))
+      return sym;
+  }
   return dlsym(RTLD_DEFAULT, name.c_str() + 1);
 }
 static void exception_callback(const char *s, unsigned len) {
@@ -2667,6 +3634,7 @@ static_assert(sizeof(NativeDict) == 24 && sizeof(NativeDictConfig) == 24);
 static std::deque<std::string> dictionaryPaths;
 static std::array<std::vector<NativeDict>, 3> dictionarySets;
 static std::array<bool, 3> wubiDictionaryAvailable{};
+static std::string userDictDir = "/work/userDict";
 static int configuredWubiDictionary = -1;
 static bool configure_wubi_dictionary(unsigned solution) {
   if (solution >= dictionarySets.size())
@@ -2675,7 +3643,7 @@ static bool configure_wubi_dictionary(unsigned solution) {
     return true;
   auto &dicts = dictionarySets[solution];
   NativeDictConfig config{dicts.data(), uint32_t(dicts.size()), 0,
-                          "/work/userDict"};
+                          userDictDir.c_str()};
   const bool loaded =
       ((bool (*)(const NativeDictConfig *))syms.at("_wxime_config_dict"))(&config);
   if (loaded)
@@ -2833,6 +3801,105 @@ static void record(std::vector<unsigned char> &b) {
   ehframe.insert(ehframe.end(), b.begin(), b.end());
 }
 static void setup_unwind(const std::vector<std::string> &entries) {
+#if defined(__aarch64__)
+  std::vector<unsigned char> cie;
+  emit32(cie, 0);
+  cie.push_back(1);
+  cie.push_back('z');
+  cie.push_back('P');
+  cie.push_back('L');
+  cie.push_back('R');
+  cie.push_back(0);
+  cie.push_back(4);
+  cie.push_back(0x78);
+  cie.push_back(30);
+  cie.push_back(11);
+  cie.push_back(0);
+  emit64(cie, (uintptr_t)dlsym(RTLD_DEFAULT, "__gxx_personality_v0"));
+  cie.push_back(0);
+  cie.push_back(0);
+  cie.push_back(0x0c);
+  cie.push_back(31);
+  cie.push_back(0);
+  record(cie);
+  for (auto &line : entries) {
+    std::istringstream s(line);
+    std::string tag;
+    uintptr_t addr, len, enc, lsda;
+    s >> tag >> std::hex >> addr >> len >> enc >> lsda;
+    std::vector<unsigned char> b;
+    emit32(b, ehframe.size() + 4);
+    emit64(b, addr);
+    emit64(b, len);
+    if (lsda) {
+      b.push_back(8);
+      emit64(b, lsda);
+    } else {
+      b.push_back(0);
+    }
+    b.push_back(0x41);
+    b.push_back(0x0c);
+    b.push_back(29);
+    b.push_back(16);
+    b.push_back(0x80 | 30);
+    b.push_back(1);
+    b.push_back(0x80 | 29);
+    b.push_back(2);
+
+    int slot = 3;
+    uint32_t x_pairs = enc & 0x1F;
+    if (x_pairs & 0x01) {
+      b.push_back(0x80 | 19); uleb(b, slot++);
+      b.push_back(0x80 | 20); uleb(b, slot++);
+    }
+    if (x_pairs & 0x02) {
+      b.push_back(0x80 | 21); uleb(b, slot++);
+      b.push_back(0x80 | 22); uleb(b, slot++);
+    }
+    if (x_pairs & 0x04) {
+      b.push_back(0x80 | 23); uleb(b, slot++);
+      b.push_back(0x80 | 24); uleb(b, slot++);
+    }
+    if (x_pairs & 0x08) {
+      b.push_back(0x80 | 25); uleb(b, slot++);
+      b.push_back(0x80 | 26); uleb(b, slot++);
+    }
+    if (x_pairs & 0x10) {
+      b.push_back(0x80 | 27); uleb(b, slot++);
+      b.push_back(0x80 | 28); uleb(b, slot++);
+    }
+    uint32_t d_pairs = (enc >> 8) & 0x0F;
+    if (d_pairs & 0x01) {
+      b.push_back(0x05); uleb(b, 72); uleb(b, slot++);
+      b.push_back(0x05); uleb(b, 73); uleb(b, slot++);
+    }
+    if (d_pairs & 0x02) {
+      b.push_back(0x05); uleb(b, 74); uleb(b, slot++);
+      b.push_back(0x05); uleb(b, 75); uleb(b, slot++);
+    }
+    if (d_pairs & 0x04) {
+      b.push_back(0x05); uleb(b, 76); uleb(b, slot++);
+      b.push_back(0x05); uleb(b, 77); uleb(b, slot++);
+    }
+    if (d_pairs & 0x08) {
+      b.push_back(0x05); uleb(b, 78); uleb(b, slot++);
+      b.push_back(0x05); uleb(b, 79); uleb(b, slot++);
+    }
+    record(b);
+  }
+  emit32(ehframe, 0);
+  auto fn = (void (*)(void *))dlsym(RTLD_DEFAULT, "__register_frame");
+  if (!fn) {
+    void *h = dlopen("libgcc_s.so.1", RTLD_NOW | RTLD_GLOBAL);
+    if (h) fn = (void (*)(void *))dlsym(h, "__register_frame");
+  }
+  if (!fn) {
+    fputs("missing ELF unwind registration\n", stderr);
+    _exit(86);
+  }
+  fn(ehframe.data());
+  fprintf(stderr, "UNWIND registered %zu ARM64 frame entries\n", entries.size());
+#else
   std::vector<unsigned char> cie;
   emit32(cie, 0);
   for (auto c : {1, 'z' + 0, 'P' + 0, 'L' + 0, 'R' + 0, 0, 1, 0x78, 16, 11, 0})
@@ -2866,11 +3933,16 @@ static void setup_unwind(const std::vector<std::string> &entries) {
   emit32(ehframe, 0);
   auto fn = (void (*)(void *))dlsym(RTLD_DEFAULT, "__register_frame");
   if (!fn) {
+    void *h = dlopen("libgcc_s.so.1", RTLD_NOW | RTLD_GLOBAL);
+    if (h) fn = (void (*)(void *))dlsym(h, "__register_frame");
+  }
+  if (!fn) {
     fputs("missing ELF unwind registration\n", stderr);
     _exit(86);
   }
   fn(ehframe.data());
   fprintf(stderr, "UNWIND registered %zu RBP frame entries\n", entries.size());
+#endif
 }
 int main(int argc, char **argv) {
   if (argc != 3 && argc != 4) {
@@ -2882,10 +3954,12 @@ int main(int argc, char **argv) {
                  !strcmp(argv[2], "flurry-server") ||
                  !strcmp(argv[2], "flurry-wxp2p-server") ||
                  !strcmp(argv[2], "wxp2p-probe");
-  if (!service_mode) {
+  if (!service_mode && !getenv("WETYPE_NO_ALARM")) {
     const bool long_operation =
-        !strcmp(argv[2], "llm-service") || !strcmp(argv[2], "flurry-loopback");
-    alarm(long_operation ? 45 : 15);
+        !strcmp(argv[2], "llm-service") || !strcmp(argv[2], "flurry-loopback") || !strcmp(argv[2], "validate");
+    const char *alarm_sec_str = getenv("WETYPE_ALARM_SECONDS");
+    int alarm_sec = alarm_sec_str ? atoi(alarm_sec_str) : (long_operation ? 60 : 30);
+    alarm(alarm_sec);
   }
   initialize_rune_locale();
   setvbuf(stderr, nullptr, _IONBF, 0);
@@ -2896,28 +3970,50 @@ int main(int argc, char **argv) {
   sigaction(SIGBUS, &sa, nullptr);
   sigaction(SIGILL, &sa, nullptr);
   sigaction(SIGABRT, &sa, nullptr);
-  if (!dlopen("libc++.so.1", RTLD_NOW | RTLD_GLOBAL) ||
-      !dlopen("libc++abi.so.1", RTLD_NOW | RTLD_GLOBAL)) {
-    fputs(dlerror(), stderr);
-    return 2;
-  }
+  sigaction(SIGALRM, &sa, nullptr);
+  std::string home = getenv("HOME") ? getenv("HOME") : "";
   const char *support = getenv("WETYPE_SUPPORT_DIR");
   std::string support_dir = support ? support : argv[1];
+  void *cxxabi = dlopen("libc++abi.so.1", RTLD_NOW | RTLD_GLOBAL);
+  if (!cxxabi && !home.empty()) {
+    cxxabi = dlopen((home + "/.local/lib64/libc++abi.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
+  }
+  auto darwinStrPath = support_dir + "/wetypex-darwin-str.so";
+  if (access(darwinStrPath.c_str(), R_OK) == 0) {
+    darwin_str_handle = dlopen(darwinStrPath.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (!darwin_str_handle) {
+      fprintf(stderr, "failed to dlopen wetypex-darwin-str: %s\n", dlerror());
+    } else {
+      fprintf(stderr, "LOADED wetypex-darwin-str.so\n");
+    }
+  }
+  void *cxx = dlopen("libc++.so.1", RTLD_NOW | RTLD_GLOBAL);
+  if (!cxx && !home.empty()) {
+    cxx = dlopen((home + "/.local/lib64/libc++.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
+  }
+  if (!cxxabi || !cxx) {
+    const char *err = dlerror();
+    fprintf(stderr, "failed to dlopen libc++/libc++abi: %s\n", err ? err : "(null)");
+    return 2;
+  }
   auto localePath = support_dir + "/locale.so";
   if (access(localePath.c_str(), R_OK) != 0)
     localePath = support_dir + "/wetypex-locale.so";
   if (!dlopen(localePath.c_str(), RTLD_NOW | RTLD_GLOBAL)) {
-    fputs(dlerror(), stderr);
+    const char *err = dlerror();
+    fprintf(stderr, "failed to dlopen locale (%s): %s\n", localePath.c_str(), err ? err : "(null)");
     return 2;
   }
   if (!dlopen((support_dir + "/libkqueue.so").c_str(),
               RTLD_NOW | RTLD_GLOBAL)) {
-    fputs(dlerror(), stderr);
+    const char *err = dlerror();
+    fprintf(stderr, "failed to dlopen libkqueue: %s\n", err ? err : "(null)");
     return 2;
   }
   if (!dlopen((support_dir + "/wcwss_bridge.so").c_str(),
               RTLD_NOW | RTLD_GLOBAL)) {
-    fputs(dlerror(), stderr);
+    const char *err = dlerror();
+    fprintf(stderr, "failed to dlopen wcwss_bridge: %s\n", err ? err : "(null)");
     return 2;
   }
   if (std::string(argv[2]) == "network-info") {
@@ -3171,11 +4267,20 @@ int main(int argc, char **argv) {
   for (auto &[addr, name] : ctors) {
     const bool voiceLogger = mode == "voice-service" &&
                              name.find("wx_zhiling_tlogger") != std::string::npos;
+#if defined(__aarch64__)
+    if (!voiceLogger && (addr < 0x1005757b4 || addr >= 0x1019b15a4))
+      continue;
+    if (name.find("flag.cc") != std::string::npos)
+      continue;
+#else
     if (!voiceLogger && (addr < 0x1005f51c0 || addr >= 0x101b00000))
       continue;
+#endif
     if (verbose_host)
       fprintf(stderr, "CTOR %lx %s\n", addr, name.c_str());
     ((void (*)())addr)();
+    if (verbose_host)
+      fprintf(stderr, "CTOR_DONE %lx %s\n", addr, name.c_str());
   }
   fprintf(stderr, "CORE_CONSTRUCTORS_RETURNED\n");
   if (mode == "voice-service")
@@ -3185,8 +4290,25 @@ int main(int argc, char **argv) {
   // Version-pinned wxime initialization ABI.
   alignas(16) unsigned char config[1024]{};
   const char *work = getenv("WETYPE_WORK_DIR");
-  if (!work || !*work)
-    work = "/work/user";
+  std::string defaultWork;
+  if (!work || !*work) {
+    if (access("/work", W_OK) == 0) {
+      work = "/work/user";
+    } else {
+      const char *home = getenv("HOME");
+      defaultWork = (home && *home) ? std::string(home) + "/.cache/wetypex"
+                                    : "/tmp/wetypex";
+      work = defaultWork.c_str();
+    }
+  }
+  std::error_code work_ec;
+  std::filesystem::create_directories(work, work_ec);
+  if (work) {
+    userDictDir = std::string(work) + "/userDict";
+    std::filesystem::create_directories(userDictDir, work_ec);
+    std::filesystem::create_directories(userDictDir + "/v5", work_ec);
+    std::filesystem::create_directories(userDictDir + "/user_hot_word", work_ec);
+  }
   memcpy(config + 0x18, &work, 8);
   void *logger = (void *)engine_log;
   memcpy(config, &logger, 8);
@@ -3236,7 +4358,10 @@ int main(int argc, char **argv) {
     s >> id >> version >> name;
     if (name.empty())
       continue;
-    dictionaryPaths.push_back("/input/resources/" + name);
+    std::string resPath = "/input/resources/" + name;
+    if (access(resPath.c_str(), R_OK) != 0)
+      resPath = dir + "/resources/" + name;
+    dictionaryPaths.push_back(resPath);
     static const std::array<std::string, 3> wubiNames{
         "swbd86.bin", "swbd98.bin", "swbdnc.bin"};
     for (unsigned solution = 0; solution < dictionarySets.size(); ++solution) {
