@@ -56,6 +56,29 @@ if [ "$standalone" = 0 ] && [ -f "$account/identity.json" ]; then
   fi
 fi
 
+can_bwrap=0
+if command -v bwrap >/dev/null 2>&1 && bwrap --ro-bind /usr /usr --symlink usr/bin /bin --proc /proc --dev /dev true 2>/dev/null; then
+  can_bwrap=1
+fi
+
+if [ "$can_bwrap" = 0 ]; then
+  mkdir -p "$state/userDict/v5" "$state/userDict/user_hot_word"
+  export PATH="${PATH:-/usr/bin:/bin}"
+  export HOME="$state"
+  export WETYPE_SUPPORT_DIR="$support"
+  if [ "$standalone" = 0 ] && [ -f "$account/identity.json" ]; then
+    export WETYPE_NETWORK_LIVE=1
+    export WETYPE_CORE_UIN="$uin"
+    export WETYPE_CORE_DEVICE_CODE="$device_code"
+    export WETYPE_DEVICE_MODEL="$model"
+    export WETYPE_GROUP_ID="$group_id"
+    export WETYPE_GROUP_FUNCTIONS="$group_functions"
+    export WETYPE_HOTWORD_VERSION="$hotword_version"
+  fi
+  cd "$state"
+  exec "$support/wetypex-engine-host" "$runtime" serve
+fi
+
 # Offline and standalone sessions retain a private network namespace.
 # Clear the launch environment before bwrap: Focal's 0.4 lacks --clearenv.
 env -i PATH="${PATH:-/usr/bin:/bin}" bwrap --unshare-net --unshare-pid --die-with-parent \
