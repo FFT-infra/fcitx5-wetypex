@@ -1,11 +1,73 @@
 #define _LIBCPP_ABI_ALTERNATE_STRING_LAYOUT 1
 #include <string>
+#include <filesystem>
 #include <stdexcept>
 #include <system_error>
 #include <cstdlib>
+#include <cstdio>
 
 template class std::__1::basic_string<char>;
 template class std::__1::basic_string<wchar_t>;
+
+namespace std::__1::__fs::filesystem {
+
+path::__string_view path::__root_name() const {
+  return __string_view();
+}
+
+path::__string_view path::__root_directory() const {
+  if (!__pn_.empty() && __pn_[0] == '/')
+    return __string_view(__pn_.data(), 1);
+  return __string_view();
+}
+
+path::__string_view path::__root_path_raw() const {
+  return __root_directory();
+}
+
+path::__string_view path::__filename() const {
+  if (__pn_.empty())
+    return __string_view();
+  if (__pn_.size() == 1 && __pn_[0] == '/')
+    return __string_view(__pn_.data(), 1);
+  size_t last_slash = __pn_.rfind('/');
+  if (last_slash == string_type::npos)
+    return __string_view(__pn_.data(), __pn_.size());
+  if (last_slash + 1 == __pn_.size())
+    return __string_view();
+  return __string_view(__pn_.data() + last_slash + 1, __pn_.size() - last_slash - 1);
+}
+
+path::__string_view path::__parent_path() const {
+  if (__pn_.empty())
+    return __string_view();
+  size_t last_slash = __pn_.rfind('/');
+  if (last_slash == string_type::npos)
+    return __string_view();
+  if (last_slash == 0)
+    return __string_view(__pn_.data(), 1);
+  return __string_view(__pn_.data(), last_slash);
+}
+
+path::__string_view path::__relative_path() const {
+  if (__pn_.empty())
+    return __string_view();
+  if (__pn_[0] == '/') {
+    size_t pos = __pn_.find_first_not_of('/');
+    if (pos == string_type::npos)
+      return __string_view();
+    return __string_view(__pn_.data() + pos, __pn_.size() - pos);
+  }
+  return __string_view(__pn_.data(), __pn_.size());
+}
+
+int path::__compare(__string_view s) const {
+  __string_view my_sv(__pn_.data(), __pn_.size());
+  return my_sv.compare(s);
+}
+
+} // namespace std::__1::__fs::filesystem
+
 
 namespace std::__1 {
 double stod(const string &__str, size_t *__idx) {
@@ -49,6 +111,51 @@ unsigned long long stoull(const string &__str, size_t *__idx, int __base) {
   unsigned long long res = ::strtoull(__str.c_str(), &end, __base);
   if (__idx) *__idx = end - __str.c_str();
   return res;
+}
+string to_string(int val) {
+  char buf[32];
+  int n = ::snprintf(buf, sizeof(buf), "%d", val);
+  return string(buf, n > 0 ? n : 0);
+}
+string to_string(long val) {
+  char buf[32];
+  int n = ::snprintf(buf, sizeof(buf), "%ld", val);
+  return string(buf, n > 0 ? n : 0);
+}
+string to_string(long long val) {
+  char buf[32];
+  int n = ::snprintf(buf, sizeof(buf), "%lld", val);
+  return string(buf, n > 0 ? n : 0);
+}
+string to_string(unsigned val) {
+  char buf[32];
+  int n = ::snprintf(buf, sizeof(buf), "%u", val);
+  return string(buf, n > 0 ? n : 0);
+}
+string to_string(unsigned long val) {
+  char buf[32];
+  int n = ::snprintf(buf, sizeof(buf), "%lu", val);
+  return string(buf, n > 0 ? n : 0);
+}
+string to_string(unsigned long long val) {
+  char buf[32];
+  int n = ::snprintf(buf, sizeof(buf), "%llu", val);
+  return string(buf, n > 0 ? n : 0);
+}
+string to_string(float val) {
+  char buf[32];
+  int n = ::snprintf(buf, sizeof(buf), "%f", val);
+  return string(buf, n > 0 ? n : 0);
+}
+string to_string(double val) {
+  char buf[32];
+  int n = ::snprintf(buf, sizeof(buf), "%f", val);
+  return string(buf, n > 0 ? n : 0);
+}
+string to_string(long double val) {
+  char buf[64];
+  int n = ::snprintf(buf, sizeof(buf), "%Lf", val);
+  return string(buf, n > 0 ? n : 0);
 }
 }
 

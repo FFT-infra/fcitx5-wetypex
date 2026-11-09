@@ -2420,8 +2420,15 @@ class WeType : public InputMethodEngineV2 {
       commitStringAtCursor(ic, cursorPrefix, position);
     }
     spacingBypass_ = previousSpacingBypass;
-    if (seq != s->seq)
+    if (commits && json_object_is_type(commits, json_type_array) &&
+        json_object_array_length(commits) > 0) {
+      s->selectionPending = false;
+    }
+    if (seq != s->seq) {
+      if (s->selectionPending && s->seq > seq + 5)
+        s->selectionPending = false;
       return;
+    }
     s->selectionPending = false;
     s->preedit = wire::str(j.get(), "preedit");
     s->cursor =
@@ -3586,8 +3593,16 @@ public:
         (sym == FcitxKey_space || (sym >= FcitxKey_1 && sym <= FcitxKey_9))) {
       const unsigned pageIndex =
           sym == FcitxKey_space ? 0 : unsigned(sym - FcitxKey_1);
-      if (selectByKey(ic, sym == FcitxKey_space ? -1 : int(pageIndex)))
-        e.filterAndAccept();
+      if (!selectByKey(ic, sym == FcitxKey_space ? -1 : int(pageIndex))) {
+        if (sym == FcitxKey_space && !s->preedit.empty()) {
+          if (send(ic, "raw")) {
+            s->selectionPending = true;
+            ic->inputPanel().setCandidateList(nullptr);
+            panel(ic, s);
+          }
+        }
+      }
+      e.filterAndAccept();
       return;
     }
     if (commandModifiers)
