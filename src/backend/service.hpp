@@ -615,10 +615,10 @@ static void service_loop() {
         config[0x28] = static_cast<unsigned char>(wubiSolution);
         config[0xaf] = wire::number(request.get(), "wubi_wildcard_comment", 0);
         if (wire::number(request.get(), "smart_input", 1)) {
-          // InputAugmenter: transpose, neighbouring-key, insertion and skip
-          // correction. Offsets are recovered from the original JNI bridge.
-          for (unsigned offset : {0x8u, 0x9u, 0xau, 0xbu, 0xcu})
-            config[offset] = 1;
+          // InputAugmenter: on desktop, only enable transpose correction (0x8).
+          // Mobile touch-screen neighbouring-key (0x9), insertion (0xa), and skip (0xb)
+          // cause severe mis-corrections on physical keyboards (e.g. "gan" -> "fan", "ni" -> "bi").
+          config[0x8] = 1;
         }
         config[0x0d] = wire::number(request.get(), "fuzzy_nl", 0);
         config[0x0e] = wire::number(request.get(), "fuzzy_rl", 0);
