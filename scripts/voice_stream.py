@@ -266,7 +266,8 @@ class Backend:
                    '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--dir', '/etc']
         for name in ('resolv.conf', 'hosts', 'nsswitch.conf'):
             command += ['--ro-bind', '/etc/' + name, '/etc/' + name]
-        for path in ('/etc/ssl', '/etc/pki', '/etc/ca-certificates'):
+        for path in ('/etc/ssl', '/etc/pki', '/etc/ca-certificates',
+                     str(Path.home() / '.local/lib64'), str(Path.home() / '.local/lib')):
             command += ['--ro-bind-try', path, path]
         command += ['--ro-bind', str(RUNTIME), '/input', '--ro-bind', str(SUPPORT), '/support',
                     '--bind', str(directory), '/work', '--chdir', '/work',

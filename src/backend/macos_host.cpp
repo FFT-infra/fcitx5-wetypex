@@ -1153,6 +1153,24 @@ DEFINE_CTOR_WRAPPER_3(shim_system_error_ec_str_ctor, "_ZNSt3__112system_errorC1E
 DEFINE_CTOR_WRAPPER_2(shim_codecvt_ctor, "_ZNSt3__17codecvtIwc11__mbstate_tEC2Em", size_t)
 DEFINE_CTOR_WRAPPER_3(shim_istream_sentry_ctor, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE6sentryC1ERS3_b", void *, bool)
 DEFINE_CTOR_WRAPPER_2(shim_ostream_sentry_ctor, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_", void *)
+extern "C" void *shim_future_void_ctor(void *self, void *state) {
+  if (state) {
+    auto *bytes = static_cast<unsigned char *>(state);
+    auto *mutex = reinterpret_cast<pthread_mutex_t *>(bytes + 0x18);
+    auto *condition = reinterpret_cast<pthread_cond_t *>(bytes + 0x58);
+    if (*reinterpret_cast<uint64_t *>(mutex) == 0x32aaaba7ULL) {
+      memset(mutex, 0, sizeof(*mutex));
+      pthread_mutex_init(mutex, nullptr);
+    }
+    if (*reinterpret_cast<uint64_t *>(condition) == 0x3cb0b1bbULL) {
+      memset(condition, 0, sizeof(*condition));
+      pthread_cond_init(condition, nullptr);
+    }
+  }
+  static auto fn = (void (*)(void *, void *))dlsym(RTLD_DEFAULT, "_ZNSt3__16futureIvEC1EPNS_17__assoc_sub_stateE");
+  if (fn) fn(self, state);
+  return self;
+}
 #endif
 extern "C" int shim_cond_init(void *p, const void *a) {
   if (a) {
@@ -1222,6 +1240,45 @@ extern "C" void shim_cpp_cv_timed_wait(void *p, void *lock,
 extern "C" bool shim_cpp_mutex_try_lock(void *p) {
   return shim_mutex_trylock(p) == 0;
 }
+#if defined(__aarch64__)
+extern "C" void *shim_promise_void_get_future(void *promise);
+extern "C" void *shim_promise_void_get_future_impl(void *promise, void *output) {
+  auto *state = promise ? *static_cast<void **>(promise) : nullptr;
+  if (state) {
+    auto *bytes = static_cast<unsigned char *>(state);
+    auto *mutex = reinterpret_cast<pthread_mutex_t *>(bytes + 0x18);
+    auto *condition = reinterpret_cast<pthread_cond_t *>(bytes + 0x58);
+    if (*reinterpret_cast<uint64_t *>(mutex) == 0x32aaaba7ULL) {
+      memset(mutex, 0, sizeof(*mutex));
+      pthread_mutex_init(mutex, nullptr);
+    }
+    if (*reinterpret_cast<uint64_t *>(condition) == 0x3cb0b1bbULL) {
+      memset(condition, 0, sizeof(*condition));
+      pthread_cond_init(condition, nullptr);
+    }
+  }
+  static auto ctor = (void (*)(void *, void *))[]() {
+    void *cxx = dlopen("libc++.so.1", RTLD_NOW | RTLD_NOLOAD);
+    void *fn = cxx ? dlsym(cxx, "_ZNSt3__16futureIvEC1EPNS_17__assoc_sub_stateE") : nullptr;
+    if (!fn)
+      fn = dlsym(RTLD_DEFAULT, "_ZNSt3__16futureIvEC1EPNS_17__assoc_sub_stateE");
+    return fn;
+  }();
+  if (ctor) {
+    ctor(output, state);
+  } else if (output) {
+    *static_cast<void **>(output) = state;
+  }
+  return output;
+}
+
+__asm__(
+    ".global shim_promise_void_get_future\n"
+    ".type shim_promise_void_get_future, %function\n"
+    "shim_promise_void_get_future:\n"
+    "  mov x1, x8\n"
+    "  b shim_promise_void_get_future_impl\n");
+#else
 extern "C" void shim_promise_void_get_future(void *output, void *promise) {
   // Flurry constructs libc++'s __assoc_sub_state inline with Darwin's static
   // pthread signatures, then calls the dynamically imported get_future().
@@ -1251,6 +1308,7 @@ extern "C" void shim_promise_void_get_future(void *output, void *promise) {
     _exit(86);
   original(output, promise);
 }
+#endif
 extern "C" int shim_threadid(pthread_t t, uint64_t *out) {
   if (t && !pthread_equal(t, pthread_self()))
     return ENOTSUP;
@@ -3640,6 +3698,8 @@ static void *resolve(const std::string &name) {
       {"__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE6sentryC2ERS3_b", (void *)shim_istream_sentry_ctor},
       {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_", (void *)shim_ostream_sentry_ctor},
       {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC2ERS3_", (void *)shim_ostream_sentry_ctor},
+      {"__ZNSt3__16futureIvEC1EPNS_17__assoc_sub_stateE", (void *)shim_future_void_ctor},
+      {"__ZNSt3__16futureIvEC2EPNS_17__assoc_sub_stateE", (void *)shim_future_void_ctor},
 #endif
   };
   overrides.emplace("__ZNSt3__17promiseIvE10get_futureEv",
@@ -3793,7 +3853,11 @@ struct LlmSearchParam {
 static_assert(sizeof(LlmSearchParam) == 64);
 static void run_llm_service(const char *question) {
   const char *app = "LINUX";
+#if defined(__aarch64__)
+  using Search = uint32_t (*)(const LlmSearchParam &, decltype(&llm_service_callback));
+#else
   using Search = uint32_t (*)(decltype(&llm_service_callback), LlmSearchParam);
+#endif
   auto search = (Search)syms.at("_wxime_cloud_llm_search_without_session");
   auto invoke = [&](const char *text,
                     const std::vector<unsigned char> &cookie) {
@@ -3810,7 +3874,11 @@ static void run_llm_service(const char *question) {
                              uint32_t(strlen(app)),
                              false,
                              {}};
+#if defined(__aarch64__)
+    return search(parameter, llm_service_callback);
+#else
     return search(llm_service_callback, parameter);
+#endif
   };
   uint32_t request = invoke(question, {});
   fprintf(stdout, "LLM_REQUEST id=%u\n", request);

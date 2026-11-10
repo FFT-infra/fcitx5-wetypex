@@ -154,7 +154,9 @@ if(LIBCXX_INCLUDE_DIR)
 endif()
 if(LIBCXX_LIBRARY)
   get_filename_component(LIBCXX_LIBDIR "${LIBCXX_LIBRARY}" DIRECTORY)
-  set(WETYPE_LIBCXX_LINK_FLAGS "-L${LIBCXX_LIBDIR}" "-Wl,-rpath,${LIBCXX_LIBDIR}")
+  set(WETYPE_LIBCXX_LINK_FLAGS "-L${LIBCXX_LIBDIR}" "-Wl,-rpath,${LIBCXX_LIBDIR}" "-Wl,-rpath,\$ORIGIN")
+else()
+  set(WETYPE_LIBCXX_LINK_FLAGS "-Wl,-rpath,\$ORIGIN")
 endif()
 option(WETYPE_BUNDLED_CURL "Embed pinned WebSocket-capable libcurl in the transport bridge" ON)
 if(WETYPE_BUNDLED_CURL)
@@ -179,10 +181,15 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     DEPENDS src/backend/darwin_str.cpp VERBATIM COMMAND_EXPAND_LISTS)
   add_custom_target(wetypex-darwin-str ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/wetypex-darwin-str.so)
 endif()
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  set(WETYPE_WCWSS_CXX_FLAGS -nostdinc++ -isystem ${LIBCXX_INCLUDE_DIR}/c++/v1 -D_LIBCPP_ABI_ALTERNATE_STRING_LAYOUT=1)
+else()
+  set(WETYPE_WCWSS_CXX_FLAGS -stdlib=libc++ ${WETYPE_LIBCXX_COMPILE_FLAGS})
+endif()
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/wcwss_bridge.so
-  COMMAND ${WETYPE_CLANGXX} -std=c++17 -stdlib=libc++ ${WETYPE_LIBCXX_COMPILE_FLAGS} -shared -fPIC -O2
+  COMMAND ${WETYPE_CLANGXX} -std=c++17 ${WETYPE_WCWSS_CXX_FLAGS} -shared -fPIC -O2
   ${WETYPE_CURL_COMPILE_FLAGS} ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/wcwss_bridge.cpp
-  ${WETYPE_CURL_LINK_FLAGS} ${WETYPE_LIBCXX_LINK_FLAGS} -pthread -Wl,-z,relro,-z,now,-z,defs
+  ${WETYPE_CURL_LINK_FLAGS} ${WETYPE_LIBCXX_LINK_FLAGS} -lc++ -lc++abi -pthread -Wl,-z,relro,-z,now
   -o ${CMAKE_CURRENT_BINARY_DIR}/wcwss_bridge.so
   DEPENDS src/backend/wcwss_bridge.cpp ${WETYPE_CURL_LIBRARY} VERBATIM COMMAND_EXPAND_LISTS)
 add_custom_target(wetypex-wcwss-bridge ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/wcwss_bridge.so)

@@ -70,6 +70,8 @@ Function callback(const std::shared_ptr<void> &owner, size_t index) {
 }
 void onOpen(const std::shared_ptr<Connection> &connection, bool success,
             int error, const std::string &message) {
+  if (getenv("WETYPE_DEBUG_NETWORK"))
+    fprintf(stderr, "WCWSS_ONOPEN success=%d error=%d message=%s\n", (int)success, error, message.c_str());
   bridgeState = success ? 1 : 2;
   bridgeError = error;
   using Function =
@@ -263,16 +265,15 @@ extern "C" int wcwss_connect_socket(const std::shared_ptr<void> &callbackOwner,
     auto object = callbackOwner.get();
     auto table = object ? *reinterpret_cast<void ***>(object) : nullptr;
     fprintf(stderr,
-            "WSS_BRIDGE callback=%p table=%p entries=%p,%p,%p,%p client=%zu "
-            "url=%zu headers=%zu protocols=%zu\n",
-            object, table, table ? table[0] : nullptr,
-            table ? table[1] : nullptr, table ? table[2] : nullptr,
-            table ? table[3] : nullptr, client.size(), url.size(),
-            headers.size(), protocols.size());
+            "WSS_BRIDGE callback=%p table=%p client=%s url=%s\n",
+            object, table, client.c_str(), url.c_str());
   }
   if (!callbackOwner || client.empty() ||
-      (url.rfind("wss://", 0) != 0 && url.rfind("ws://", 0) != 0))
+      (url.rfind("wss://", 0) != 0 && url.rfind("ws://", 0) != 0)) {
+    if (getenv("WETYPE_DEBUG_NETWORK"))
+      fprintf(stderr, "WCWSS_CONNECT_SOCKET rejected: empty client or invalid url\n");
     return 100002;
+  }
   ++bridgeCalls;
   auto connection = std::make_shared<Connection>();
   connection->callback = callbackOwner;

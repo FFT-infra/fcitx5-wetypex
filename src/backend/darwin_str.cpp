@@ -10,6 +10,13 @@
 template class std::__1::basic_string<char>;
 template class std::__1::basic_string<wchar_t>;
 
+template std::__1::basic_string<char> std::__1::operator+<char, std::__1::char_traits<char>, std::__1::allocator<char>>(
+    const char *, const std::__1::basic_string<char> &);
+template std::__1::basic_string<char> std::__1::operator+<char, std::__1::char_traits<char>, std::__1::allocator<char>>(
+    const std::__1::basic_string<char> &, const char *);
+template std::__1::basic_string<char> std::__1::operator+<char, std::__1::char_traits<char>, std::__1::allocator<char>>(
+    const std::__1::basic_string<char> &, const std::__1::basic_string<char> &);
+
 namespace std::__1::__fs::filesystem {
 
 path::__string_view path::__root_name() const {
